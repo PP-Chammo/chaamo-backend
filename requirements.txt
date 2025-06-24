@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+httpx[http2]
+beautifulsoup4
+lxml
+sentence-transformers
+torch
+Pillow
+thefuzz
+python-Levenshtein
+supabase
+python-dotenv
