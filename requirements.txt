@@ -10,4 +10,3 @@ thefuzz
 python-Levenshtein
 supabase
 python-dotenv
-a2wsgi
