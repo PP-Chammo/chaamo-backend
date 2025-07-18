@@ -1,4 +1,3 @@
-import json
 from app.services.supabase import supabase
 from app.models.card import FinalGroupedCard
 

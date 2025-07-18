@@ -3,10 +3,10 @@ from typing import List
 
 from app.models.card import FinalGroupedCard
 from app.utils.embedding_extractor import get_image_embedding
-from app.utils.scrape_helpers import parse_raw_cards_data, group_cards
+from app.utils.ebay_scrape_helpers import parse_raw_cards_data, group_cards
 
 
-async def process_scrape_cards(html_text: str) -> List[FinalGroupedCard]:
+async def process_ebay_scrape(html_text: str) -> List[FinalGroupedCard]:
     """
     Processes HTML and groups cards with detailed output per card.
     """
@@ -65,7 +65,7 @@ async def process_scrape_cards(html_text: str) -> List[FinalGroupedCard]:
             print(f"   ❌ ERROR creating FinalGroupedCard for group {i}: {e}")
             print(f"      Group data: {g}")
 
-    print(f"\n🎯 Processing completed:")
+    print("\n🎯 Processing completed:")
     print(f"   📊 Raw cards found: {len(raw_cards_data)}")
     print(f"   📊 Cards with features: {len(cards_with_features)}")
     print(f"   📊 Groups created: {len(groups)}")

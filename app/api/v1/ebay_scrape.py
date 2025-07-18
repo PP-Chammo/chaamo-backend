@@ -3,9 +3,9 @@ from httpx import HTTPStatusError, RequestError
 from bs4 import BeautifulSoup
 
 from app.models.card import ScrapeResponse, Region, SearchPage
-from app.utils.fetcher import fetch_html
-from app.handlers.scrape_cards_handler import process_scrape_cards
-from app.utils.scrape_helpers import save_debug_html
+from app.utils.ebay_fetcher import fetch_html
+from app.handlers.ebay_scrape_handler import process_ebay_scrape
+from app.utils.ebay_scrape_helpers import save_debug_html
 from app.utils.supabase_helpers import save_to_supabase
 
 router = APIRouter()
@@ -29,7 +29,7 @@ async def scrape_cards_endpoint(
     Endpoint to scrape data of sold cards from eBay, save it to Supabase,
     and return the results.
     """
-    print(f"\n🚀 Starting scrape_cards endpoint")
+    print("\n🚀 Starting ebay_scrape endpoint")
     print(f"   📝 Query: '{query}'")
     print(f"   🌍 Region: {region.value}")
     print(f"   📄 Page: {page.value}")
@@ -40,7 +40,19 @@ async def scrape_cards_endpoint(
     
     try:
         print("🌐 Fetching HTML from eBay...")
-        html_text = await fetch_html(query=query, region=region.value, page=page.value)
+        ebay_domain = "com" if region.value == "us" else "co.uk"
+        url = f"https://www.ebay.{ebay_domain}/sch/i.html"
+        params = {
+            "_from": "R40",
+            "_nkw": query,
+            "_sacat": "0",
+            "rt": "nc",
+            "LH_Sold": "1",
+            "LH_Complete": "1",
+            "Country/Region of Manufacture": "United States" if region.value == "us" else "United Kingdom",
+            "_pgn": page.value
+        }
+        html_text = await fetch_html(url=url, params=params)
         print(f"   ✅ HTML fetched successfully ({len(html_text)} characters)")
         
     except HTTPStatusError as e:
@@ -59,7 +71,7 @@ async def scrape_cards_endpoint(
 
     try:
         print("🔧 Processing scraped data...")
-        grouped_cards = await process_scrape_cards(html_text)
+        grouped_cards = await process_ebay_scrape(html_text)
 
         if not grouped_cards:
             print("❌ ERROR: No grouped cards returned from processing")
@@ -85,7 +97,7 @@ async def scrape_cards_endpoint(
         items = soup.select('li.s-item, li.s-card')
         print(f"   🔍 Found {len(items)} potential items in HTML for debugging")
         save_debug_html(str(items))
-        print(f"   📝 Full error details:")
+        print("   📝 Full error details:")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="An internal error occurred while parsing the data.")

@@ -21,7 +21,7 @@ try:
     # Test the connection by making a simple query
     try:
         print("🔍 Testing Supabase connection...")
-        test_response = supabase.table('cards').select('id').limit(1).execute()
+        test_response = supabase.table('categories').select('id').limit(1).execute()
         print("✅ Supabase connection test successful")
         print(f"   📊 Test query returned: {len(test_response.data)} rows")
     except Exception as test_error:

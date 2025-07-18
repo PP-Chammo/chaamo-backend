@@ -74,3 +74,32 @@ You can now interact with the API via the interactive Swagger UI.
 
 - Ensure a stable internet connection for the initial model download.
 - The model will be cached, so future runs will be faster.
+
+## v2 API: /api/v2/link
+
+### POST /api/v2/link/link
+Send a message over the Meshtastic mesh network.
+
+**Request Body:**
+```
+{
+  "message": "string", // required
+  "destination": "string" // optional, node ID
+}
+```
+
+**Response:**
+```
+{
+  "success": true,
+  "sent_message": "string",
+  "detail": "string" // status or error detail
+}
+```
+
+**Example:**
+```
+curl -X POST "http://localhost:8000/api/v2/link/link" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "hello mesh!", "destination": "^all"}'
+```
