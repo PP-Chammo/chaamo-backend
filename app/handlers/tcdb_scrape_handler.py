@@ -156,7 +156,6 @@ async def discover_sets(target: ScrapeTarget) -> List[dict]:
             })
         try:
             response = (supabase.table('card_sets').upsert(upserts, on_conflict='set_id').execute())
-            print(response)
         except Exception as e:
             print(f"Supabase upsert error: {e}")
     return result
@@ -180,7 +179,7 @@ async def discover_cards(set_id: int) -> List[dict]:
                     img = first_td.find('img')
                     for a in a_tags:
                         href = a.get("href").split('?')[0]
-                        img_url = img.get("data-original").replace("/Thumbs/", "/Cards/").replace("_", "-").replace("RepThumb.jpg", "RepFr.jpg")
+                        img_url = img.get("data-original").replace("/Thumbs/", "/Cards/").replace("_", "-").replace("Thumb.jpg", "Fr.jpg")
                         if href.startswith("/ViewCard.cfm"):
                             _, _, _, set_id, _, card_id, *rest_name = href.split("/")
                             parsed_name = "/".join(rest_name).replace("-", " ")
@@ -188,7 +187,7 @@ async def discover_cards(set_id: int) -> List[dict]:
                                 "name": parsed_name,
                                 "set_id": set_id,
                                 "card_id": card_id,
-                                "link": f"{href}",
+                                "link": f"{base_target_url}{href}",
                                 "image_url": f"{base_target_url}{img_url}"
                             })
                             break

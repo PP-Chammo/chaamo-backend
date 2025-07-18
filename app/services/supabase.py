@@ -7,7 +7,7 @@ load_dotenv()
 
 # Get Supabase credentials from environment variables
 url: str = os.environ.get("SUPABASE_URL") or "https://atdordzshxrtafbogpiw.supabase.co"
-key: str = os.environ.get("SUPABASE_SERVICE_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF0ZG9yZHpzaHhydGFmYm9ncGl3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTAzMjk5NzcsImV4cCI6MjA2NTkwNTk3N30.VaFd0kZ63XCMY9Q1ScP9Km2N-j9Cioz4mM8haYylUNA"
+key: str = os.environ.get("SUPABASE_SERVICE_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF0ZG9yZHpzaHhydGFmYm9ncGl3Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MDMyOTk3NywiZXhwIjoyMDY1OTA1OTc3fQ.6irH8QRQQrY2v8Sjb0yykZQPgqaf50uyFo-IVO1rNm8"
 
 print(f"🔧 Initializing Supabase connection...")
 print(f"   🌐 URL: {url}")
