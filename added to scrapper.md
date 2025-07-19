@@ -4,8 +4,8 @@ SCARLET AND VIOLET SERIES
 <!-- Pokemon Journey Together -->
 <!-- Pokemon Stellar Crown -->
 <!-- Pokemon Shrouded Fable -->
-<!-- Pokemon Destine Rivals -->
 <!-- Pokemon Trick or Trade 2024 /2023 -->
+<!-- Pokemon Destined Rivals -->
 <!-- Pokemon Twilight Masquerade -->
 <!-- Pokemon Temporal Forces -->
 <!-- Pokemon Paldean Fates -->
@@ -17,7 +17,7 @@ SCARLET AND VIOLET SERIES
 <!-- Pokemon Scarlet and Violet -->
 
 SWORD AND SHIELD SERIES
-Crown Zenith
+<!-- Crown Zenith -->
 Crown Zenith - Galarian Gallery
 Silver Tempest - Trainer Gallery
 Silver Tempest
@@ -25,19 +25,19 @@ Silver Tempest
 <!-- Astral Radiance -->
 <!-- Brilliant Stars -->
 <!-- Fusion Strike -->
-Celebrations
-Evolving Skies
-Chilling Reign
+<!-- Celebrations -->
+<!-- Evolving Skies -->
+<!-- Chilling Reign
 Battle Styles
 Shining Fates
 McDonald's 25th Anniversary
-Vivid Voltage
-Champion's Path
-Pokemon Futsal Promos
+Vivid Voltage -->
+<!-- Champion's Path
+Pokemon Futsal Promos -->
 <!-- Darkness Ablaze -->
 <!-- Rebel Clash -->
-Sword & Shield
-Sword & Shield Promos
+<!-- Sword & Shield
+Sword & Shield Promos -->
 
 Topps 2024 Soccer Card Sets 
 UEFA Competitions (Champions League, Europa League, etc.):

@@ -13,50 +13,41 @@ ignored_title_words = ["sticker", "japanese"]
 sets = {
     "Topps": {
         "urls": [
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Chrome",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Museum%20Collection",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Finest%20Flashbacks",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Merlin%20Heritage%2095",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Premier%20Club",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Premier%20Gold",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Premier%20Stars"
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Chrome",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Museum%20Collection",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Finest%20Flashbacks",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Merlin%20Heritage%2095",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Premier%20Club",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Premier%20Gold",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Topps%20Premier%20Stars"
         ],
         "sets": [
-            "2023",
-            "2024",
-            "UEFA",
-            "Merlin",
+            # "2023",
+            # "2024",
+            # "UEFA",
+            # "Merlin",
         ]
     },
     "Panini": {
         "urls": [
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Prizm",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Select",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Obsidian",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Immaculate%20Collection",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Chronicles",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20UEFA%20Champions%20League",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20UEFA%20Euro",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Revolution",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20National%20Treasures",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Eminence",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Mosaic",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Eminence",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Eminence",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Eminence",
-            "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Eminence",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Prizm",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Select",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Obsidian",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Immaculate%20Collection",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Chronicles",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20UEFA%20Champions%20League",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20UEFA%20Euro",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Revolution",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20National%20Treasures",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Eminence",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Mosaic",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Eminence",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Eminence",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Eminence",
+            # "https://www.tcdb.com/ViewAll.cfm/sp/Soccer/brand/Panini%20Eminence",
         ],
         "sets": [
-            "Prizm",
-            "Select",
-            "Obsidian",
-            "Immaculate",
-            "Chronicles",
-            "UEFA",
-            "Revolution",
-            "National Treasures",
-            
         ]
     },
     "Pokemon": {
@@ -75,7 +66,9 @@ sets = {
             "Stellar Crown",
             "Shrouded Fable",
             "Destined Rivals",
-            "Trick or Trade",
+            "2024 Trick or Trade",
+            "2023 Trick or Trade",
+            "Destined Rivals",
             "Twilight Masquerade",
             "Temporal Forces",
             "Paldean Fates",
@@ -84,17 +77,26 @@ sets = {
             "Obsidian Flames",
             "Paldea Evolved",
             "Energize",
-            "Scarlet & Violet",
+            "2023 Scarlet & Violet",
+            "Crown Zenith",
+            "Sword & Shield Silver",
+            "Sword & Shield Celebrations",
+            "Sword & Shield Evolving Skies",
+            "Sword & Shield Chilling Reign",
+            "Sword & Shield Battle Styles",
+            "Sword & Shield Shining Fates",
+            "McDonald's 25th Anniversary",
+            "Sword & Shield Vivid Voltage",
+            "Sword & Shield Champion's Path",
+            "Pokemon Futsal Promos",
             "Sword & Shield",
-            "Lost",
-            "Origin",
-            "Astral Radiance"
         ]
     }
 }
 
 async def discover_sets(target: ScrapeTarget) -> List[dict]:
     selected_category = sets[target]
+    category_index = list(ScrapeTarget).index(target)
     result = []
     for url in selected_category["urls"]:
         html_text = await fetch_html(url, headers=get_random_headers())
@@ -125,7 +127,8 @@ async def discover_sets(target: ScrapeTarget) -> List[dict]:
                                             end_year = int(str(start_year)[:2] + end_part)
                                         else:
                                             end_year = int(end_part)
-                                        years.extend([start_year, end_year])
+                                        # Create full range array
+                                        years.extend(range(start_year, end_year + 1))
                                     else:
                                         years.append(start_year)
                                 years = [int(y) for y in years] if years else None
@@ -135,60 +138,81 @@ async def discover_sets(target: ScrapeTarget) -> List[dict]:
                                 # Extract sid from link
                                 link_val = a.get("href", "")
                                 set_id_match = re.search(r"/sid/(\d+)/", link_val)
-                                set_id = set_id_match.group(1) if set_id_match else None
+                                platform_set_id = set_id_match.group(1) if set_id_match else None
                                 result.append({
+                                    "category_id": category_index + 1,
+                                    "platform": base_target_url,
+                                    "platform_set_id": platform_set_id,
                                     "name": a_text,
                                     "years": years,
-                                    "set_id": set_id,
-                                    "link": f"{base_target_url}/Checklist.cfm/sid/{set_id}" if set_id else None,
+                                    "link": f"{base_target_url}/Checklist.cfm/sid/{platform_set_id}" if platform_set_id else None,
                                 })
                                 break
     if result:
-        category_id = list(ScrapeTarget).index(target)
         upserts = []
         for set_obj in result:
-            upserts.append({
-                'category_id': category_id + 1,
-                'name': set_obj['name'],
-                'years': set_obj['years'],
-                'set_id': set_obj['set_id'],
-                'link': set_obj['link'],
-            })
+            upserts.append(set_obj)
         try:
-            response = (supabase.table('card_sets').upsert(upserts, on_conflict='set_id').execute())
+            res = (supabase.table("card_sets").upsert(upserts, on_conflict="platform_set_id").execute())
+            print(f"Upsert card_sets {len(res.data)} rows")
         except Exception as e:
-            print(f"Supabase upsert error: {e}")
+            print(f"Supabase upsert card_sets error: {e}")
     return result
 
 # -----------------------------------------------------------------------------------------------------------------------
 
-async def discover_cards(set_id: int) -> List[dict]:
-    url = f"{base_target_url}/Checklist.cfm/sid/{set_id}"
+async def discover_cards(platform_set_id: int) -> List[dict]:
+    response = (supabase.table("card_sets").select("id, category_id").eq("platform_set_id", platform_set_id).execute())
+    set_id = response.data[0]["id"]
+    category_id = response.data[0]["category_id"]
+    url = f"{base_target_url}/Checklist.cfm/sid/{platform_set_id}"
     result = []
-    html_text = await fetch_html(url, headers=get_random_headers())
-    soup = BeautifulSoup(html_text, "lxml")
-    tables = soup.find_all("table")
-    if tables:
-        table = tables[-1] if isinstance(tables[-1], Tag) else None
-        if table:
-            for row in table.find_all("tr"):
-                first_td = row.find('td')
-                if first_td:
-                    print("-----------------------------")
-                    a_tags = first_td.find_all('a', href=True)
-                    img = first_td.find('img')
-                    for a in a_tags:
-                        href = a.get("href").split('?')[0]
-                        img_url = img.get("data-original").replace("/Thumbs/", "/Cards/").replace("_", "-").replace("Thumb.jpg", "Fr.jpg")
-                        if href.startswith("/ViewCard.cfm"):
-                            _, _, _, set_id, _, card_id, *rest_name = href.split("/")
-                            parsed_name = "/".join(rest_name).replace("-", " ")
-                            result.append({
-                                "name": parsed_name,
-                                "set_id": set_id,
-                                "card_id": card_id,
-                                "link": f"{base_target_url}{href}",
-                                "image_url": f"{base_target_url}{img_url}"
-                            })
-                            break
+    existing_cards = set()
+    for page_number in range(1, 5):
+        html_text = await fetch_html(f"{url}?PageIndex={page_number}", headers=get_random_headers())
+        soup = BeautifulSoup(html_text, "lxml")
+        tables = soup.find_all("table")
+        for table in tables:
+            target_colors = ["#F7F9F9", "#EAEEEE"]
+            rows = table.find_all("tr", attrs={"bgcolor": lambda c, colors=target_colors: c in colors})
+            for row in rows:
+                tds = row.find_all("td")
+                for td in tds:
+                    a_tags = td.find_all("a", href=True)
+                    img = td.find("img") if td.find("img") else None
+                    if (a_tags and img):
+                        for a in a_tags:
+                            href = a.get("href").split("?")[0]
+                            if href.startswith("/ViewCard.cfm"):
+                                _, _, _, platform_set_id, _, platform_card_id, *name_arr = href.split("/")
+                                img_url = img.get("data-original").replace("/Thumbs/", "/Cards/").replace("_", "-").replace("Thumb.jpg", "Fr.jpg")
+                                full_img_url = f"{base_target_url}{img_url}" if (str(platform_set_id) in img_url and str(platform_card_id) in img_url) else None
+                                if platform_card_id in existing_cards:
+                                    continue
+                                existing_cards.add(platform_card_id)
+                                parsed_name = "/".join(name_arr).replace("-", " ")
+                                match_year = re.match(r'^(\d{4})\b', parsed_name)
+                                match_card_number = re.search(r'\b\d{1,3}/\d{1,3}\b', parsed_name.partition(' ')[2])
+                                result.append({
+                                    "category_id": category_id,
+                                    "set_id": set_id,
+                                    "platform": base_target_url,
+                                    "platform_card_id": platform_card_id,
+                                    "name": parsed_name,
+                                    "card_number": match_card_number.group() if match_card_number else None,
+                                    "year":  match_year.group(1) if match_year else None,
+                                    "link": f"{base_target_url}{href}",
+                                    "canonical_image_url": full_img_url
+                                })
+                                break
+    if result:
+        upserts = []
+        for card_obj in result:
+            upserts.append(card_obj)
+        try:
+            res = (supabase.table("master_cards").upsert(upserts, on_conflict="platform_card_id").execute())
+            print(f"Upsert master_cards {len(res.data)} rows")
+        except Exception as e:
+            print(f"Supabase upsert master_cards error: {e}")
+    print(f"Found {len(result)} cards")
     return result

@@ -2,22 +2,24 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 from enum import Enum
 
-class CardData(BaseModel):
+class SetData(BaseModel):
+    category_id: int
+    platform: str
+    platform_set_id: str
     name: str
-    set_id: int
-    card_id: int
-    card_number: Optional[str] = None
-    # manufacturer: Optional[str] = None
-    # year: Optional[int] = None
-    # team: Optional[str] = None
-    link: str
-    image_url: Optional[str] = None
-
-class SetInfo(BaseModel):
-    name: str
-    set_id: Optional[str] = None
-    link: str
     years: Optional[List[int]] = None
+    link: str
+
+class CardData(BaseModel):
+    category_id: int
+    set_id: str
+    platform: str
+    platform_card_id: str
+    name: str
+    card_number: Optional[str] = None
+    year: Optional[int] = None
+    link: str
+    canonical_image_url: Optional[str] = None
 
 # Enum for selectable categories/brands
 class ScrapeTarget(str, Enum):
@@ -38,7 +40,7 @@ class DiscoverSetsRequest(BaseModel):
     targets: List[ScrapeTarget] = Field(..., description="A list of categories/brands to discover sets for.")
 
 class SetsResponse(BaseModel):
-    sets: List[SetInfo]
+    sets: List[SetData]
 
 class CardsResponse(BaseModel):
     cards: List[CardData]
