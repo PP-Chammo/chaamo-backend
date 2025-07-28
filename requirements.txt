@@ -5,8 +5,7 @@ beautifulsoup4
 lxml
 sentence-transformers
 torch
-Pillow
-thefuzz
-python-Levenshtein
 supabase
 python-dotenv
+python-dateutil
+pytz

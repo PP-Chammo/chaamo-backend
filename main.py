@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.v1 import scrape_cards as api_v1
+from src.api.v1 import router as v1_endpoint
 
 # Create an instance of the FastAPI application
 app = FastAPI(
@@ -21,7 +21,7 @@ app.add_middleware(
 
 
 # Include the router from v1 with a prefix
-app.include_router(api_v1.router, prefix="/api/v1", tags=["Scraping v1"])
+app.include_router(v1_endpoint, prefix="/api/v1", tags=["Scraping v1"])
 
 # Root endpoint for health check
 @app.get("/", tags=["Root"])
