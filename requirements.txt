@@ -3,7 +3,6 @@ uvicorn[standard]
 httpx[http2]
 beautifulsoup4
 lxml
-sentence-transformers
 torch
 supabase
 python-dotenv
