@@ -40,48 +40,48 @@ Pokemon Futsal Promos -->
 Sword & Shield Promos -->
 
 Topps 2024 Soccer Card Sets 
-UEFA Competitions (Champions League, Europa League, etc.):
-Topps UEFA Club Competitions 2023/24 (Flagship set; includes UCL, UEL, UECL)
-Topps Chrome UEFA Club Competitions 2023/24
-Topps Museum Collection UEFA Club Competitions 2023/24
+<!-- UEFA Competitions (Champions League, Europa League, etc.): only 2024 Champions League Final found -->
+<!-- Topps UEFA Club Competitions 2023/24 (Flagship set; includes UCL, UEL, UECL): cant find UCL, UELm UECL -->
+<!-- Topps Chrome UEFA Club Competitions 2023/24 -->
+<!-- Topps Museum Collection UEFA Club Competitions 2023/24
 Topps Finest UEFA Club Competitions 2023/24
-Topps Merlin Chrome 2023/24 
-Topps Stadium Club Chrome UEFA 2023/24
-Topps Superstars 2023/24
-Topps MLS 2024 (Flagship Paper Set)
-Topps Chrome MLS 2024
+Topps Merlin Chrome 2023/24  -->
+<!-- Topps Stadium Club Chrome UEFA 2023/24 -->
+<!-- Topps Superstars 2023/24 -->
+<!-- Topps MLS 2024 (Flagship Paper Set) -->
+<!-- Topps Chrome MLS 2024 -->
 
 Global Club Sets:
-Topps FC 
-Topps Now UEFA Club Competitions 
-Topps Deco 2023/24 
+<!-- Topps FC  -->
+<!-- Topps Now UEFA Club Competitions  -->
+<!-- Topps Deco 2023/24  -->
 Argentina lineage hobby box
 
 Club-Specific Sets :
-Topps Liverpool FC 2023/24 Team Set
+<!-- Topps Liverpool FC 2023/24 Team Set
 Topps Real Madrid CF 2023/24 Team Set
 Topps FC Barcelona 2023/24 Team Set
 Topps Bayern Munich 2023/24 Team Set
 Topps PSG 2023/24 Team Set
 Arsenal Team Set
 Manchester City Team Set
-Topps Argentina Team Set
+Topps Argentina Team Set -->
 
 Bundesliga Sets (Germany) :
-Topps Bundesliga 2023/24
+<!-- Topps Bundesliga 2023/24
 Topps Chrome Bundesliga 2023/24
 Topps Finest Bundesliga 2023/24
 Topps Museum Collection Bundesliga 2023/24
-Topps Stadium Club Chrome Bundesliga 2023/24
+Topps Stadium Club Chrome Bundesliga 2023/24 -->
 
 Specialty & Limited Releases :
-Topps Living Set UEFA / Bundesliga (ongoing illustrated cards)
+<!-- Topps Living Set UEFA / Bundesliga (ongoing illustrated cards)
 Topps Match Attax 2023/24 (UEFA Club Competitions, kid-friendly, more game-focused)
 Topps Match Attax Chrome 2023/24
-Topps Match Attax Extra 2023/24 (mid-season update)
+Topps Match Attax Extra 2023/24 (mid-season update) -->
 
 Topps Soccer Card Sets – 2023
-UEFA Club Competitions (UCL, UEL, UECL):
+<!-- UEFA Club Competitions (UCL, UEL, UECL):
 Topps UEFA Club Competitions 2022/23 (Flagship set – includes all UEFA tournaments)
 Topps Chrome UEFA Club Competitions 2022/23
 Topps Museum Collection UEFA Club Competitions 2022/23
@@ -92,18 +92,18 @@ Topps Deco UEFA 2022/23
 Topps Now UEFA Club Competitions 2022/23 
 Topps Superstars 2022/23
 Topps MLS 2023 
-Topps Chrome MLS 2023
+Topps Chrome MLS 2023 -->
 
 
 Bundesliga (Germany) :
-Topps Bundesliga 2022/23
+<!-- Topps Bundesliga 2022/23
 Topps Chrome Bundesliga 2022/23
 Topps Finest Bundesliga 2022/23
 Topps Museum Collection Bundesliga 2022/23
-Topps Stadium Club Chrome Bundesliga 2022/23
+Topps Stadium Club Chrome Bundesliga 2022/23 -->
 
 Club Team Sets (European Giants) :
-Topps Liverpool FC 2022/23 Team Set
+<!-- Topps Liverpool FC 2022/23 Team Set
 Topps Real Madrid CF 2022/23 Team Set
 Topps FC Barcelona 2022/23 Team Set
 Topps Bayern Munich 2022/23 Team Set
@@ -112,50 +112,50 @@ Topps Arsenal Team Set
 Topps Manchester United Team Set
 Topps Manchester City Team Set
 Topps Argentina Team Set
-Topps Argentina Fileteado 2023 
+Topps Argentina Fileteado 2023  -->
 
 
 Specialty, Limited, and Print-On-Demand :
-Topps Living Set UEFA / Bundesliga 
+<!-- Topps Living Set UEFA / Bundesliga 
 Topps FC 
 Topps Match Attax 2022/23
 Topps Match Attax Chrome 2022/23
-Topps Match Attax Extra 2022/23
+Topps Match Attax Extra 2022/23 -->
 
 Other 2023 Releases:
-Topps Paris Saint-Germain Chrome 2022/23
+<!-- Topps Paris Saint-Germain Chrome 2022/23
 Topps Barcelona Chrome 2022/23
-Topps Real Madrid Chrome 2022/23
+Topps Real Madrid Chrome 2022/23 -->
 
 2023 Topps F1 Releases
 Flagship & Chrome Sets
-Topps Formula 1 2023 
-Topps Chrome Formula 1 2023
-Topps Chrome Formula 1 Sapphire Edition 2023
+<!-- Topps Formula 1 2023  -->
+<!-- Topps Chrome Formula 1 2023
+Topps Chrome Formula 1 Sapphire Edition 2023 -->
 Specialty Sets
-Topps Dynasty F1 2023
-Topps F1 Turbo Attax 2023
-Topps Now Formula 1 2023
-Topps F1 Chrome Lite 2023 (Sometimes skipped in the U.S.)
+<!-- Topps Dynasty F1 2023 -->
+<!-- Topps F1 Turbo Attax 2023 -->
+<!-- Topps Now Formula 1 2023 -->
+<!-- Topps F1 Chrome Lite 2023 (Sometimes skipped in the U.S.) -->
 
 2024 Topps F1 Releases
 So far (confirmed or released):
-Topps Formula 1 2024 (Flagship Set)
+<!-- Topps Formula 1 2024 (Flagship Set)
 Topps Chrome Formula 1 2024
 Topps Chrome Sapphire F1 2024
 Topps Dynasty F1 2024
 Topps Now F1 2024
-Turbo Attax 2024
+Turbo Attax 2024 -->
 
 Topps Disney Card Sets – 2023
-Topps Disney 100 (Base)
+<!-- Topps Disney 100 (Base)
 Topps Disney 100 Chrome
-Topps Disney 100 Platinum Celebration
+Topps Disney 100 Platinum Celebration -->
 Topps x Kakawow Phantom (Series 1)
 Topps Disney Lorcana Promo Cards
 
 Topps Disney Card Sets – 2024
-Topps Disney 100 Chrome (Wave 2)
+<!-- Topps Disney 100 Chrome (Wave 2) -->
 Topps Disney 100 Sapphire Edition
 Topps x Kakawow Phantom (Series 2)
 Topps Disney PIXAR 2024

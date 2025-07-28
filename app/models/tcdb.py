@@ -21,7 +21,6 @@ class CardData(BaseModel):
     link: str
     canonical_image_url: Optional[str] = None
 
-# Enum for selectable categories/brands
 class ScrapeTarget(str, Enum):
     topps = "Topps"
     panini = "Panini"

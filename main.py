@@ -2,10 +2,11 @@ import subprocess
 import sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.v1 import router as api_v1
-from app.api.v2 import router as api_v2
+from app.api.ebay import router as api_ebay
+from app.api.tcdb import router as api_tcdb
+from app.api.bulk import router as api_bulk
+from app.utils.compare_image import setup_models
 
-# Create an instance of the FastAPI application
 app = FastAPI(
     title="Chaamo Card Scraper API",
     description="API for scraping data of sold cards on eBay and tcdb.com with grouping.",
@@ -13,13 +14,14 @@ app = FastAPI(
 )
 
 @app.on_event("startup")
-async def ensure_playwright_installed():
+async def startup_tasks():
     try:
         import playwright
     except ImportError:
         subprocess.run([sys.executable, "-m", "pip", "install", "playwright"], check=True)
-    # Always ensure browser binaries are present
     subprocess.run([sys.executable, "-m", "playwright", "install"], check=True)
+
+    setup_models()
 
 origins = ["*"]
 
@@ -33,8 +35,9 @@ app.add_middleware(
 
 
 # Include the router from v1 with a prefix
-app.include_router(api_v1, prefix="/api/v1", tags=["Scraping v1"])
-app.include_router(api_v2, prefix="/api/v2", tags=["Scraping v2"])
+app.include_router(api_ebay, prefix="/api/ebay", tags=["EBAY Endpoint"])
+app.include_router(api_tcdb, prefix="/api/tcdb", tags=["TCDB Endpoint"])
+app.include_router(api_bulk, prefix="/api/bulk", tags=["Bulk Endpoint"])
 
 # Root endpoint for health check
 @app.get("/", tags=["Root"])
