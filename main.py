@@ -2,10 +2,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from src.api.v1 import router as v1_endpoint
 
-# Create an instance of the FastAPI application
 app = FastAPI(
-    title="eBay Card Scraper API",
-    description="API for scraping data of sold cards on eBay with grouping.",
+    title="API",
+    description="Chaamo API",
     version="1.0.0"
 )
 
@@ -20,14 +19,19 @@ app.add_middleware(
 )
 
 
-# Include the router from v1 with a prefix
 app.include_router(v1_endpoint, prefix="/api/v1", tags=["Scraping v1"])
 
-# Root endpoint for health check
 @app.get("/", tags=["Root"])
 def read_root():
-    return {"status": "ok", "message": "Welcome to the eBay Scraper API!"}
+    return {"status": "ok", "message": "Welcome Chaamo API!"}
 
-# To run this application, use the following command:
+# debug purpose, because in render.com swagger cant be load
+try:
+    app.openapi()
+    print("✅ OpenAPI schema valid 🎉")
+except Exception as e:
+    print("❌ Failed to generate OpenAPI schema:", e)
+
+# To run this application for development:
 # uvicorn main:app --reload
 
