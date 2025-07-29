@@ -17,7 +17,7 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
     for page in range(1, total_pages + 1):
         result_per_page = []
         print('----------')
-        print(f"fetch page {page}")
+        print(f"scraping page {page}...")
         params = {
             "_nkw": query,
             "_sacat": "0",
@@ -26,6 +26,7 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
             "LH_Sold": "1",
             "LH_Complete": "1",
             "Country/Region of Manufacture": "United States" if region == "us" else "United Kingdom",
+            "_ipg": 240,
             "_pgn": page
         }
         html_text = await playwright_get_content(url=url, params=params)
@@ -143,10 +144,10 @@ async def get_ebay_page_count(query: str, region: Region) -> int:
         return 1
     result_tag =result_tag .find("span", class_="BOLD")
     total_posts = result_tag.get_text(strip=True)
-    print(f"found {total_posts} posts")
+    print(f"found {total_posts} raw posts")
     total_results = int(total_posts)
-    total_pages = math.ceil(total_results / 60)
-    return total_pages + 1
+    total_pages = math.ceil(total_results / 240)
+    return total_pages
 
 
 def deduplicate_by_id(records: list[dict]) -> list[dict]:
