@@ -6,7 +6,7 @@ from playwright.async_api import async_playwright
 import os
 import sys
 
-headless = False
+headless = True
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -56,6 +56,7 @@ async def playwright_get_content(url: str, params: Optional[dict[str, str]] = No
             browser = await p.chromium.launch(
                 headless=headless,
                 args=[
+                    "--headless=chrome",
                     "--no-sandbox",
                     "--disable-gpu",
                     "--disable-dev-shm-usage",
