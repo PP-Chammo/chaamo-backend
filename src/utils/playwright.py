@@ -53,7 +53,18 @@ async def playwright_get_content(url: str, params: Optional[dict[str, str]] = No
             page = await browser.new_page()
         else:
             random_user_agent = random.choice(USER_AGENTS)
-            browser = await p.chromium.launch(headless=headless)
+            browser = await p.chromium.launch(
+                headless=headless,
+                args=[
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-tools",
+                    "--no-zygote",
+                    "--single-process"
+                ]
+            )
             context = await browser.new_context(user_agent=random_user_agent)
             page = await context.new_page()
         await page.add_init_script(STEALTH_JS)
