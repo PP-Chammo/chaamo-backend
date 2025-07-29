@@ -13,4 +13,4 @@ async def search_endpoint(
     master_card_id: Optional[str] = Query(None, description="(Optional) can get id from master_cards table")
 ):
     result = await ebay_search_handler(query, region, master_card_id)
-    return { "total": len(result), "result": result }
+    return result

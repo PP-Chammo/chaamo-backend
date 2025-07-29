@@ -13,9 +13,9 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
     url = f"{base_target_url[region]}/sch/i.html"
     total_pages = await get_ebay_page_count(query, region)
     print(f"Total pages: {total_pages}")
-    # result = []
+    total_result = []
     for page in range(1, total_pages + 1):
-        result = []
+        result_per_page = []
         print('----------')
         print(f"fetch page {page}")
         params = {
@@ -52,7 +52,7 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
             price = float(re.findall(r'\d+\.\d+', price_raw)[-1])
             condition, grading_company, grade = get_condition_and_grade(title)
             post_url = link_element.get('href')
-            result.append({
+            result_per_page.append({
                 "id": post_id,
                 "master_card_id": master_card_id,
                 "title": title,
@@ -67,9 +67,9 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
                 "post_url": post_url,
             })
 
-        if len(result) > 0:
+        if len(result_per_page) > 0:
             try:
-                ebay_posts_payload = deduplicate_by_id(result)
+                ebay_posts_payload = deduplicate_by_id(result_per_page)
                 res = (supabase.table("ebay_posts").upsert(ebay_posts_payload, on_conflict="id").execute())
                 print(f"Upsert ebay_posts {len(res.data)} rows")
 
@@ -86,6 +86,7 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
                 ]
                 res = (supabase.table("listings").upsert(listings_payload, on_conflict="ebay_post_id").execute())
                 print(f"Upsert listings {len(res.data)} rows")
+                total_result += ebay_posts_payload
             except Exception as e:
                 print(f"Supabase upsert ebay_posts error: {e}")
 
@@ -110,8 +111,11 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
     #         print(f"Upsert listings {len(res.data)} rows")
     #     except Exception as e:
     #         print(f"Supabase upsert ebay_posts error: {e}")
-    print(f"Found {len(result)} posts")
-    return result
+    print(f"Found {len(total_result)} posts")
+    return {
+        "total": len(total_result),
+        "result": total_result,
+    }
 
 
 
