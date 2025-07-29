@@ -7,7 +7,7 @@ import pytz
 
 from src.models.ebay import Region, base_target_url
 from src.utils.supabase import supabase
-from src.utils.httpx import httpx_get_content
+from src.utils.playwright import playwright_get_content
 
 async def ebay_search_handler(query: str, region: Region, master_card_id: Optional[str] = None):
     url = f"{base_target_url[region]}/sch/i.html"
@@ -15,6 +15,7 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
     print(f"Total pages: {total_pages}")
     result = []
     for page in range(1, total_pages + 1):
+        print(f"fetch page {page}")
         params = {
             "_nkw": query,
             "_sacat": "0",
@@ -25,7 +26,7 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
             "Country/Region of Manufacture": "United States" if region == "us" else "United Kingdom",
             "_pgn": page
         }
-        html_text = await httpx_get_content(url=url, params=params)
+        html_text = await playwright_get_content(url=url, params=params)
         soup = BeautifulSoup(html_text, 'lxml')
         items = soup.select('li.s-item, li.s-card')
         for item in items:
@@ -66,9 +67,23 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
 
     if result:
         try:
-            upserts = deduplicate_by_id(result)
-            res = (supabase.table("ebay_posts").upsert(upserts, on_conflict="id").execute())
+            ebay_posts_payload = deduplicate_by_id(result)
+            res = (supabase.table("ebay_posts").upsert(ebay_posts_payload, on_conflict="id").execute())
             print(f"Upsert ebay_posts {len(res.data)} rows")
+
+            listings_payload = [
+                {
+                    "ebay_post_id": item["id"],
+                    "listing_type": "ebay",
+                    "status": "sold",
+                    "created_at": item["sold_at"],
+                    "currency": item["currency"],
+                    "price": item["price"],
+                }
+                for item in res.data
+            ]
+            res = (supabase.table("listings").upsert(listings_payload, on_conflict="ebay_post_id").execute())
+            print(f"Upsert listings {len(res.data)} rows")
         except Exception as e:
             print(f"Supabase upsert ebay_posts error: {e}")
     print(f"Found {len(result)} posts")
@@ -91,9 +106,10 @@ async def get_ebay_page_count(query: str, region: Region) -> int:
         "Country/Region of Manufacture": "United States" if region == "us" else "United Kingdom",
         "_pgn": "1"
     }
-    html_text = await httpx_get_content(url=url, params=params)
+    html_text = await playwright_get_content(url=url, params=params)
     soup = BeautifulSoup(html_text, 'lxml')
     result_tag = soup.select_one(".srp-controls__count-heading, .result-count__count-heading")
+    print(result_tag)
     if not result_tag:
         print(soup.find_all("h1"))
         return 1

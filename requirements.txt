@@ -5,6 +5,7 @@ beautifulsoup4
 lxml
 torch
 supabase
+playwright
 python-dotenv
 python-dateutil
 pytz
