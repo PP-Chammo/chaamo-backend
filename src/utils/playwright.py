@@ -57,8 +57,8 @@ async def playwright_get_content(
 
     user_data = user_data_dir or USER_DATA_DIR
     random_user_agent = random.choice(USER_AGENTS)
+    print('----------')
     print(f"[INFO] Scraping URL: {url}")
-    print(f"[INFO] User-Agent: {random_user_agent}")
 
     try:
         async with async_playwright() as p:
@@ -85,7 +85,12 @@ async def playwright_get_content(
                 context = await browser.new_context(user_agent=random_user_agent)
                 page = await context.new_page()
 
-            page.on("console", lambda msg: print("[PAGE LOG]:", msg.text))
+            page_errors = []
+
+            page.on("console", lambda msg: (
+                page_errors.append(msg.text)
+                if msg.type == "error" else None
+            ))
 
             await page.add_init_script(STEALTH_JS)
 
@@ -109,10 +114,8 @@ async def playwright_get_content(
             found = False
             for selector in selectors:
                 try:
-                    print(f"[DEBUG] Waiting for selector: {selector}")
                     await page.wait_for_selector(selector, timeout=7000)
                     found = True
-                    print(f"[DEBUG] Selector found: {selector}")
                     break
                 except Exception as e:
                     print(f"[WARN] Selector not found: {selector}")
@@ -129,7 +132,6 @@ async def playwright_get_content(
                 return ""
 
             html = await page.content()
-            print(f"[DEBUG] HTML length: {len(html)}")
             await browser.close()
             return html
 

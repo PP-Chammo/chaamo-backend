@@ -13,8 +13,10 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
     url = f"{base_target_url[region]}/sch/i.html"
     total_pages = await get_ebay_page_count(query, region)
     print(f"Total pages: {total_pages}")
-    result = []
+    # result = []
     for page in range(1, total_pages + 1):
+        result = []
+        print('----------')
         print(f"fetch page {page}")
         params = {
             "_nkw": query,
@@ -65,27 +67,49 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
                 "post_url": post_url,
             })
 
-    if result:
-        try:
-            ebay_posts_payload = deduplicate_by_id(result)
-            res = (supabase.table("ebay_posts").upsert(ebay_posts_payload, on_conflict="id").execute())
-            print(f"Upsert ebay_posts {len(res.data)} rows")
+        if len(result) > 0:
+            try:
+                ebay_posts_payload = deduplicate_by_id(result)
+                res = (supabase.table("ebay_posts").upsert(ebay_posts_payload, on_conflict="id").execute())
+                print(f"Upsert ebay_posts {len(res.data)} rows")
 
-            listings_payload = [
-                {
-                    "ebay_post_id": item["id"],
-                    "listing_type": "ebay",
-                    "status": "sold",
-                    "created_at": item["sold_at"],
-                    "currency": item["currency"],
-                    "price": item["price"],
-                }
-                for item in res.data
-            ]
-            res = (supabase.table("listings").upsert(listings_payload, on_conflict="ebay_post_id").execute())
-            print(f"Upsert listings {len(res.data)} rows")
-        except Exception as e:
-            print(f"Supabase upsert ebay_posts error: {e}")
+                listings_payload = [
+                    {
+                        "ebay_post_id": item["id"],
+                        "listing_type": "ebay",
+                        "status": "sold",
+                        "created_at": item["sold_at"],
+                        "currency": item["currency"],
+                        "price": item["price"],
+                    }
+                    for item in res.data
+                ]
+                res = (supabase.table("listings").upsert(listings_payload, on_conflict="ebay_post_id").execute())
+                print(f"Upsert listings {len(res.data)} rows")
+            except Exception as e:
+                print(f"Supabase upsert ebay_posts error: {e}")
+
+    # if result:
+    #     try:
+    #         ebay_posts_payload = deduplicate_by_id(result)
+    #         res = (supabase.table("ebay_posts").upsert(ebay_posts_payload, on_conflict="id").execute())
+    #         print(f"Upsert ebay_posts {len(res.data)} rows")
+
+    #         listings_payload = [
+    #             {
+    #                 "ebay_post_id": item["id"],
+    #                 "listing_type": "ebay",
+    #                 "status": "sold",
+    #                 "created_at": item["sold_at"],
+    #                 "currency": item["currency"],
+    #                 "price": item["price"],
+    #             }
+    #             for item in res.data
+    #         ]
+    #         res = (supabase.table("listings").upsert(listings_payload, on_conflict="ebay_post_id").execute())
+    #         print(f"Upsert listings {len(res.data)} rows")
+    #     except Exception as e:
+    #         print(f"Supabase upsert ebay_posts error: {e}")
     print(f"Found {len(result)} posts")
     return result
 
