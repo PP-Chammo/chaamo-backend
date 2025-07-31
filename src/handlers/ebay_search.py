@@ -158,8 +158,6 @@ def deduplicate_by_id(records: list[dict]) -> list[dict]:
 
 
 def get_condition_and_grade(title: str):
-    # Simple logic: if 'PSA', 'BGS', 'SGC', 'CGC', 'CSG', 'HGA', 'GMA', 'Beckett' in title, it's graded
-    # Otherwise, raw
     grading_companies = ["PSA", "BGS", "SGC", "CGC", "CSG", "HGA", "GMA", "Beckett"]
     condition = "raw"
     grading_company = None
