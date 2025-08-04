@@ -11,8 +11,14 @@ from src.utils.playwright import playwright_get_content
 
 async def ebay_search_handler(query: str, region: Region, master_card_id: Optional[str] = None):
     url = f"{base_target_url[region]}/sch/i.html"
-    total_pages = await get_ebay_page_count(query, region)
-    print(f"Total pages: {total_pages}")
+    
+    try:
+        total_pages = await get_ebay_page_count(query, region)
+        print(f"Total pages: {total_pages}")
+    except Exception as e:
+        print(f"❌ Error getting page count: {e}")
+        return {"error": "Failed to get page count", "details": str(e)}
+    
     total_result = []
     for page in range(1, total_pages + 1):
         result_per_page = []
@@ -29,7 +35,15 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
             "_ipg": 240,
             "_pgn": page
         }
-        html_text = await playwright_get_content(url=url, params=params)
+        
+        try:
+            html_text = await playwright_get_content(url=url, params=params)
+            if not html_text:
+                print(f"⚠️  No HTML content received for page {page}")
+                continue
+        except Exception as e:
+            print(f"❌ Error scraping page {page}: {e}")
+            continue
         soup = BeautifulSoup(html_text, 'lxml')
         items = soup.select('li.s-item, li.s-card')
         for item in items:

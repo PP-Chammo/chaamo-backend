@@ -2,7 +2,7 @@ app = "chaamo-backend"
 primary_region = "lhr"
 
 [build]
-  image = "python:3.11-slim"
+  dockerfile = "Dockerfile"
 
 [env]
   PYTHONUNBUFFERED = "1"
@@ -33,3 +33,11 @@ primary_region = "lhr"
     timeout = "2s"
     grace_period = "10s"
     restart_limit = 0
+
+[deploy]
+  strategy = "immediate"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 2048
