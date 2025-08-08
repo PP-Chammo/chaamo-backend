@@ -5,7 +5,6 @@ from playwright.async_api import async_playwright
 import os
 import sys
 import traceback
-import base64
 
 headless = True
 
@@ -60,42 +59,30 @@ async def playwright_get_content(
     print('----------')
     print(f"[INFO] Scraping URL: {url}")
 
-    browser = None
-    context = None
-    page = None
-    
     try:
-        print("[DEBUG] Starting Playwright session...")
         async with async_playwright() as p:
-            print("[DEBUG] Playwright instance created successfully")
-            
-            # Always use persistent context for better stability in containers
-            print("[DEBUG] Using persistent context...")
-            browser = await p.chromium.launch_persistent_context(
-                "/tmp/playwright-user-data",
-                headless=headless,
-                user_agent=random_user_agent,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu"
-                ],
-                # Add context options for better redirect handling
-                ignore_https_errors=True,
-                extra_http_headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.5",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "DNT": "1",
-                    "Connection": "keep-alive",
-                    "Upgrade-Insecure-Requests": "1"
-                }
-            )
-            print("[DEBUG] Persistent context created successfully")
-            
-            print("[DEBUG] Creating new page...")
-            page = await browser.new_page()
-            print("[DEBUG] Page created successfully")
+            if user_data:
+                browser = await p.chromium.launch_persistent_context(
+                    user_data,
+                    headless=headless,
+                    user_agent=random_user_agent
+                )
+                page = await browser.new_page()
+            else:
+                browser = await p.chromium.launch(
+                    headless=headless,
+                    args=[
+                        "--headless=chrome",
+                        "--no-sandbox",
+                        "--disable-gpu",
+                        "--disable-dev-shm-usage",
+                        "--disable-setuid-sandbox",
+                        "--no-zygote",
+                        "--single-process"
+                    ]
+                )
+                context = await browser.new_context(user_agent=random_user_agent)
+                page = await context.new_page()
 
             page_errors = []
 
@@ -105,7 +92,6 @@ async def playwright_get_content(
             ))
 
             await page.add_init_script(STEALTH_JS)
-            print("[DEBUG] Stealth script added")
 
             await page.set_extra_http_headers({
                 "Accept-Language": "en-US,en;q=0.9",
@@ -113,66 +99,45 @@ async def playwright_get_content(
                 "Upgrade-Insecure-Requests": "1",
                 **(headers or {})
             })
-            print("[DEBUG] Headers set")
 
-            # First, test basic internet connectivity
             try:
-                print("[DEBUG] Testing internet connectivity...")
-                await page.goto("https://httpbin.org/ip", wait_until="load", timeout=30000)
-                ip_info = await page.content()
-                print(f"[DEBUG] Internet connectivity test successful: {ip_info[:200]}...")
-            except Exception as e:
-                print(f"[ERROR] Internet connectivity test failed: {e}")
-                return ""
-            
-            # Now navigate to the actual target URL with proper redirect handling
-            try:
-                print("[DEBUG] Navigating to target page...")
-                # Use 'load' instead of 'domcontentloaded' to ensure redirects are followed
-                await page.goto(url, wait_until="load", timeout=60000)
+                print("[DEBUG] Navigating to page...")
+                await page.goto(url, wait_until="domcontentloaded", timeout=90000)
                 print("[DEBUG] Page navigation complete.")
-                
-                # Wait a bit for any JavaScript redirects to complete
-                await page.wait_for_timeout(2000)
-                print("[DEBUG] Waited for potential JavaScript redirects.")
-                
             except Exception as e:
-                print(f"[ERROR] Failed to navigate to page: {e}")
+                print("[ERROR] Failed to navigate to page:")
                 traceback.print_exc()
+                await browser.close()
                 return ""
 
-            # Simple approach: get content immediately after navigation
-            print("[DEBUG] Getting page content immediately...")
-            try:
-                html = await page.content()
-                print(f"[DEBUG] Retrieved HTML content, length: {len(html)}")
-                return html
-            except Exception as e:
-                print(f"[ERROR] Failed to get page content: {e}")
-                # Try to get content using a different method
+            found = False
+            for selector in selectors:
                 try:
-                    html = await page.evaluate("() => document.documentElement.outerHTML")
-                    print(f"[DEBUG] Retrieved HTML content via evaluate, length: {len(html)}")
-                    return html
-                except Exception as e2:
-                    print(f"[ERROR] Failed to get content via evaluate: {e2}")
-                    return ""
+                    await page.wait_for_selector(selector, timeout=7000)
+                    found = True
+                    break
+                except Exception as e:
+                    print(f"[WARN] Selector not found: {selector}")
+                    traceback.print_exc()
+
+            if not found:
+                print("[WARN] No selector matched — saving debug info...")
+                await page.screenshot(path="/tmp/debug.png", full_page=True)
+                html_debug = await page.content()
+                with open("/tmp/debug.html", "w") as f:
+                    f.write(html_debug)
+                print("[DEBUG] Saved /tmp/debug.png and debug.html")
+                await browser.close()
+                return ""
+
+            html = await page.content()
+            await browser.close()
+            return html
 
     except Exception as e:
-        print(f"[ERROR] Exception during Playwright scraping: {e}")
+        print("[ERROR] Exception during Playwright scraping:")
         traceback.print_exc()
         return ""
-    finally:
-        # Clean up resources
-        try:
-            if page:
-                print("[DEBUG] Closing page...")
-                await page.close()
-        except Exception as e:
-            print(f"[WARN] Error closing page: {e}")
-            
-        # Note: Persistent context (browser) is automatically closed when the async context exits
-        print("[DEBUG] Cleanup completed")
 
 
 def setup_playwright():

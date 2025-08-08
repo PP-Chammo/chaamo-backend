@@ -87,45 +87,10 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
                 ebay_posts_payload = deduplicate_by_id(result_per_page)
                 res = (supabase.table("ebay_posts").upsert(ebay_posts_payload, on_conflict="id").execute())
                 print(f"Upsert ebay_posts {len(res.data)} rows")
-
-                listings_payload = [
-                    {
-                        "ebay_post_id": item["id"],
-                        "listing_type": "ebay",
-                        "status": "sold",
-                        "created_at": item["sold_at"],
-                        "currency": item["currency"],
-                        "price": item["price"],
-                    }
-                    for item in res.data
-                ]
-                res = (supabase.table("listings").upsert(listings_payload, on_conflict="ebay_post_id").execute())
-                print(f"Upsert listings {len(res.data)} rows")
                 total_result += ebay_posts_payload
             except Exception as e:
                 print(f"Supabase upsert ebay_posts error: {e}")
 
-    # if result:
-    #     try:
-    #         ebay_posts_payload = deduplicate_by_id(result)
-    #         res = (supabase.table("ebay_posts").upsert(ebay_posts_payload, on_conflict="id").execute())
-    #         print(f"Upsert ebay_posts {len(res.data)} rows")
-
-    #         listings_payload = [
-    #             {
-    #                 "ebay_post_id": item["id"],
-    #                 "listing_type": "ebay",
-    #                 "status": "sold",
-    #                 "created_at": item["sold_at"],
-    #                 "currency": item["currency"],
-    #                 "price": item["price"],
-    #             }
-    #             for item in res.data
-    #         ]
-    #         res = (supabase.table("listings").upsert(listings_payload, on_conflict="ebay_post_id").execute())
-    #         print(f"Upsert listings {len(res.data)} rows")
-    #     except Exception as e:
-    #         print(f"Supabase upsert ebay_posts error: {e}")
     print(f"Found {len(total_result)} posts")
     return {
         "total": len(total_result),
