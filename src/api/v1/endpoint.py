@@ -4,7 +4,6 @@ from fastapi import APIRouter, Query, HTTPException
 
 from src.handlers.ebay_search import ebay_search_handler
 from src.models.ebay import Region
-from src.utils.playwright import playwright_get_content
 
 router = APIRouter()
 
@@ -32,25 +31,4 @@ async def search_endpoint(
             status_code=500, 
             detail=f"Internal server error: {str(e)}"
         )
-
-@router.get("/test_playwright", summary="Test Playwright functionality")
-async def test_playwright():
-    """Test endpoint to verify Playwright is working"""
-    try:
-        html = await playwright_get_content("https://httpbin.org/html")
-        if html and len(html) > 0:
-            return {
-                "status": "success",
-                "message": "Playwright is working correctly",
-                "html_length": len(html)
-            }
-        else:
-            return {
-                "status": "error",
-                "message": "Playwright returned empty content"
-            }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Playwright test failed: {str(e)}"
-        }
+ 

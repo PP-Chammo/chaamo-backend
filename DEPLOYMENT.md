@@ -29,10 +29,10 @@ export SUPABASE_SERVICE_KEY="your_service_key_here"
 
 ## 🐳 Docker Build
 
-The application uses a multi-stage Docker build with:
+The application uses a Docker build with:
 
 - **Base Image**: Python 3.11-slim
-- **Dependencies**: All system libraries for Playwright
+- **Dependencies**: Standard Python dependencies only (no headless browser)
 - **Security**: Non-root user execution
 - **Health Checks**: Built-in health monitoring
 
@@ -93,7 +93,7 @@ Once deployed, your application will be available at:
 The application includes built-in health checks that monitor:
 - Application responsiveness
 - Database connectivity
-- Playwright browser availability
+ 
 
 ### Logs
 
@@ -113,7 +113,7 @@ fly status
 
 ### Common Issues
 
-1. **Playwright Installation**: The Dockerfile includes all necessary dependencies for Playwright
+1. **Network/Blocking**: eBay may rate-limit or block. The scraper uses rotating headers and retries via httpx. Re-try after a few minutes if you hit 429/403.
 2. **Memory Issues**: The application is configured to run with minimal memory usage
 3. **Database Connection**: Ensure Supabase credentials are correctly set
 

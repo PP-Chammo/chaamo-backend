@@ -55,17 +55,11 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers during build time
-ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/playwright
-RUN playwright install chromium
-RUN playwright install-deps chromium
-
 # Copy application code
 COPY . .
 
 # Create non-root user for security and ensure browser access
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
-RUN chown -R appuser:appuser /usr/local/share/playwright
 USER appuser
 
 # Expose port

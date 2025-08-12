@@ -35,11 +35,9 @@ networkx==3.5
 numpy==2.3.2
 packaging==25.0
 pillow==11.3.0
-playwright==1.54.0
 postgrest==1.1.1
 pydantic==2.11.7
 pydantic_core==2.33.2
-pyee==13.0.0
 Pygments==2.19.2
 PyJWT==2.10.1
 python-dateutil==2.9.0.post0

@@ -1,20 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from src.api.v1 import router as v1_endpoint
-from src.utils.playwright import setup_playwright
 
 app = FastAPI(
     title="API",
     description="Chaamo API",
     version="1.0.0"
 )
-
-# Setup Playwright (browsers should be installed during Docker build)
-try:
-    setup_playwright()
-except Exception as e:
-    print(f"⚠️  Playwright setup warning: {e}")
-    print("   The application will still start, but scraping may not work")
 
 origins = ["*"]
 
