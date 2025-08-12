@@ -13,6 +13,30 @@ def _region_code(region: Region | str) -> str:
     """Return canonical region code 'us' or 'uk' from Region enum or string."""
     return region.value if isinstance(region, Region) else region
 
+def _currency_code_from_text(text: str, region_hint: str) -> str:
+    """Detect currency code from price text, falling back to region hint.
+
+    Mapping examples:
+    - GBP: '£'
+    - USD: '$'
+    - EUR: '€'
+    - CAD: 'CA$', 'C$', 'CAD'
+    - AUD: 'AU$', 'A$', 'AUD'
+    """
+    t_upper = text.upper()
+    # Prioritize CAD/AUD before generic '$'
+    if "CA$" in t_upper or "C$" in t_upper or "CAD" in t_upper:
+        return "CAD"
+    if "AU$" in t_upper or "A$" in t_upper or "AUD" in t_upper:
+        return "AUD"
+    if "£" in text:
+        return "GBP"
+    if "€" in text:
+        return "EUR"
+    if "$" in text:
+        return "USD"
+    return "USD" if region_hint == "us" else "GBP"
+
 async def ebay_search_handler(query: str, region: Region, master_card_id: Optional[str] = None):
     region_str = _region_code(region)
     url = f"{base_target_url[region_str]}/sch/i.html"
@@ -66,12 +90,11 @@ async def ebay_search_handler(query: str, region: Region, master_card_id: Option
             image_url = img_element.get('src') or img_element.get('data-src') or img_element.get('data-image-src')
             sold_at = get_sold_at_by_region(sold_date_element.get_text().replace('Sold', '').strip(), region_str)
             price_text = price_element.get_text().strip() if price_element else ''
-            currency_match = re.search(r'([£$€])', price_text)
-            currency = currency_match.group(1) if currency_match else '$'
+            currency = _currency_code_from_text(price_text, region_str)
             # Normalize price: remove symbols/commas, handle ranges like "12.34 to 56.78" or "12.34-56.78"
-            normalized = re.sub(r'[£$€]', '', price_text)
+            normalized = re.sub(r'(?i)(CA\$|C\$|AU\$|A\$|USD|EUR|GBP|CAD|AUD|\$|£|€)', '', price_text, flags=re.I)
             normalized = re.sub(r',', '', normalized)
-            normalized = re.sub(r'(\d+(?:\.\d+)?)\s*(?:to|-)\s*[£$€]?\s*(\d+(?:\.\d+)?)', r'\1-\2', normalized, flags=re.I)
+            normalized = re.sub(r'(\d+(?:\.\d+)?)\s*(?:to|-)\s*(?:CA\$|C\$|AU\$|A\$|\$|£|€)?\s*(\d+(?:\.\d+)?)', r'\1-\2', normalized, flags=re.I)
             nums = re.findall(r'\d+(?:\.\d+)?', normalized)
             if not nums:
                 continue

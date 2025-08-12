@@ -19,7 +19,7 @@ app.add_middleware(
 )
 
 
-app.include_router(v1_endpoint, prefix="/api/v1", tags=["Scraping v1"])
+app.include_router(v1_endpoint, prefix="/api/v1", tags=["API Version 1"])
 
 @app.get("/", tags=["Root"])
 def read_root():
