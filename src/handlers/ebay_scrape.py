@@ -57,7 +57,7 @@ async def ebay_scrape_handler(region: Region, query: Optional[str] = None, user_
         # gagal total -> update last_sold_price=0 + log
         if user_card_id and supabase:
             try:
-                supabase.table("user_cards").update({"last_sold_price": 0}).eq("id", user_card_id).execute()
+                supabase.table("user_cards").update({"last_sold_price": 0, "last_sold_currency": "GBP" if region == "uk" else "USD"}).eq("id", user_card_id).execute()
                 supabase.table("failed_scrape_cards").insert({
                     "user_card_id": user_card_id,
                     "name": effective_query
@@ -92,6 +92,7 @@ async def ebay_scrape_handler(region: Region, query: Optional[str] = None, user_
         try:
             latest = max(total_result, key=lambda rec: safe_parse_date(rec.get("sold_at")))
             update_payload = {
+                "last_sold_currency": latest.get("currency"),
                 "last_sold_price": latest.get("price"),
                 "last_sold_post_url": latest.get("post_url"),
                 "last_sold_at": latest.get("sold_at")
