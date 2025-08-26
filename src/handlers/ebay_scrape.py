@@ -12,11 +12,6 @@ from src.utils.httpx import httpx_get_content
 
 # ---------------- Main scraper ----------------
 async def ebay_scrape_handler(region: Region, query: Optional[str] = None, user_card_id: Optional[str] = None):
-    """
-    Scrape sold/completed eBay results in parallel, retry max 5x per page.
-    Single upsert after all pages scraped. Update user_cards.last_sold_* only on success.
-    If fails after 5x retries => last_sold_price=0 + insert failed_scrape_cards.
-    """
     region_str = _region_code(region)
     base_url = f"{base_target_url[region_str]}/sch/i.html"
 
@@ -26,12 +21,14 @@ async def ebay_scrape_handler(region: Region, query: Optional[str] = None, user_
 
     # fetch master_card_id once
     mc_id = None
+    category_id = None
     if user_card_id and supabase:
         try:
-            sel = supabase.table("user_cards").select("master_card_id").eq("id", user_card_id).limit(1).execute()
+            sel = supabase.table("user_cards").select("master_card_id, category_id").eq("id", user_card_id).limit(1).execute()
             data = getattr(sel, "data", None) or []
             if data:
                 mc_id = data[0].get("master_card_id")
+                category_id = data[0].get("category_id")
         except Exception as e:
             print(f"⚠️ Failed to fetch master_card_id from user_cards: {e}")
 
@@ -44,7 +41,7 @@ async def ebay_scrape_handler(region: Region, query: Optional[str] = None, user_
 
     # scrape pages in parallel with retry
     tasks = [
-        scrape_page_with_retry(page, total_pages, base_url, effective_query, mc_id, region_str)
+        scrape_page_with_retry(page, total_pages, base_url, effective_query, mc_id, category_id, region_str)
         for page in range(1, total_pages + 1)
     ]
     results = await asyncio.gather(*tasks)
@@ -67,25 +64,17 @@ async def ebay_scrape_handler(region: Region, query: Optional[str] = None, user_
                 print(f"❌ Failed to log failed scrape: {e}")
         return {"total": 0, "result": []}
 
-    # merge user_card_id into ebay_posts.user_card_ids (single upsert)
+    # Enrich a subset with HD images from listing pages to improve quality
     try:
-        payload = total_result
-        if user_card_id and supabase:
-            ids = [p["id"] for p in payload if p.get("id")]
-            existing_res = supabase.table("ebay_posts").select("id,user_card_ids").in_("id", ids).execute()
-            existing_map = {r["id"]: (r.get("user_card_ids") or []) for r in getattr(existing_res, "data", None) or []}
-
-            for p in payload:
-                cur = [x for x in (existing_map.get(p["id"], []) or []) if x]
-                if user_card_id not in cur:
-                    cur.append(user_card_id)
-                p["user_card_ids"] = cur
-
-        if supabase:
-            res = supabase.table("ebay_posts").upsert(payload, on_conflict="id").execute()
-            print(f"Upserted {len(getattr(res, 'data', payload))} ebay_posts rows")
+        await enrich_records_with_hd_images(total_result, max_concurrency=10, max_items=200)
     except Exception as e:
-        print(f"❌ Final upsert error: {e}")
+        print(f"⚠️ Image enrichment step failed: {e}")
+
+    # Upsert in batches to avoid statement timeouts
+    try:
+        upsert_ebay_posts_chunked(total_result, user_card_id)
+    except Exception as e:
+        print(f"❌ Final upsert error (batched): {e}")
 
     # update user_cards.last_sold_* from latest sold_at
     if user_card_id and supabase and total_result:
@@ -106,7 +95,7 @@ async def ebay_scrape_handler(region: Region, query: Optional[str] = None, user_
 
 
 # ---------------- Page scraper with retry ----------------
-async def scrape_page_with_retry(page, total_pages, base_url, query, mc_id, region_str):
+async def scrape_page_with_retry(page, total_pages, base_url, query, mc_id, category_id, region_str):
     retries = 5
     for attempt in range(1, retries + 1):
         try:
@@ -147,6 +136,7 @@ async def scrape_page_with_retry(page, total_pages, base_url, query, mc_id, regi
 
                 img_el = item.select_one(".s-item__image-wrapper img, .s-card__image-wrapper img, .image-treatment img")
                 image_url = safe_img_src(img_el)
+                image_hd_url = upgrade_ebay_img_to_hd(image_url)
 
                 price_el = item.select_one(".s-item__price, .s-card__price")
                 price_text = price_el.get_text(" ", strip=True) if price_el else ""
@@ -167,6 +157,7 @@ async def scrape_page_with_retry(page, total_pages, base_url, query, mc_id, regi
                     "master_card_id": mc_id,
                     "name": title,
                     "image_url": image_url,
+                    "image_hd_url": image_hd_url,
                     "region": region_str,
                     "sold_at": sold_at,
                     "price": price_value,
@@ -175,6 +166,7 @@ async def scrape_page_with_retry(page, total_pages, base_url, query, mc_id, regi
                     "grading_company": grading_company,
                     "grade": grade,
                     "post_url": post_url,
+                    "category_id": category_id
                 })
 
             if page_records:
@@ -269,6 +261,63 @@ def deduplicate_by_id(records: List[Dict]) -> List[Dict]:
         seen[r["id"]] = r
     return list(seen.values())
 
+def upsert_ebay_posts_chunked(records: List[Dict], user_card_id: Optional[str] = None, initial_batch_size: int = 2000):
+    """
+    Upsert `records` into `ebay_posts` in batches, merging user_card_id into user_card_ids per-chunk.
+    On statement timeout or other errors, the chunk is split into halves and retried, down to single-record upserts.
+    """
+    if not supabase or not records:
+        return
+
+    def merge_user_ids_for_chunk(chunk: List[Dict]):
+        if not user_card_id:
+            return
+        ids = [p.get("id") for p in chunk if p.get("id")]
+        if not ids:
+            return
+        try:
+            existing_res = supabase.table("ebay_posts").select("id,user_card_ids").in_("id", ids).execute()
+            existing_map = {r["id"]: (r.get("user_card_ids") or []) for r in (getattr(existing_res, "data", None) or [])}
+        except Exception as e:
+            print(f"⚠️ Failed to fetch existing user_card_ids for chunk: {e}")
+            existing_map = {}
+
+        for p in chunk:
+            cur = [x for x in (existing_map.get(p.get("id"), []) or []) if x]
+            if user_card_id and user_card_id not in cur:
+                cur.append(user_card_id)
+            p["user_card_ids"] = cur
+
+    def process_chunk(chunk: List[Dict], batch_size: int):
+        # If the chunk is larger than batch_size, split into sub-batches first
+        if len(chunk) > batch_size:
+            for i in range(0, len(chunk), batch_size):
+                process_chunk(chunk[i:i+batch_size], batch_size)
+            return
+
+        # Merge user_card_ids for this chunk before upsert
+        merge_user_ids_for_chunk(chunk)
+
+        try:
+            res = supabase.table("ebay_posts").upsert(chunk, on_conflict="id").execute()
+            print(f"✅ Upserted chunk of {len(getattr(res, 'data', chunk))} rows")
+        except Exception as e:
+            msg = str(e)
+            print(f"⚠️ Upsert error on chunk size {len(chunk)}: {e}")
+            # On statement timeout or similar, split and retry; otherwise also split as fallback
+            if len(chunk) <= 1:
+                print("❌ Skipping single-record chunk due to repeated error")
+                return
+            mid = len(chunk) // 2
+            left = chunk[:mid]
+            right = chunk[mid:]
+            # Reduce batch size to be conservative after an error
+            smaller_batch = max(1, batch_size // 2)
+            process_chunk(left, smaller_batch)
+            process_chunk(right, smaller_batch)
+
+    process_chunk(records, initial_batch_size)
+
 def get_sold_at_by_region(sold_at_raw, region: Region | str):
     region_str = _region_code(region)
     try:
@@ -299,6 +348,71 @@ def safe_parse_date(v):
         return date_parser.parse(v)
     except Exception:
         return date_parser.parse("1970-01-01T00:00:00Z")
+
+def upgrade_ebay_img_to_hd(url: Optional[str]) -> Optional[str]:
+    """Normalize i.ebayimg.com URLs to s-l1600 while preserving extension."""
+    if not url:
+        return None
+    try:
+        if "i.ebayimg.com" in url:
+            return re.sub(r"/s-l[0-9]{2,4}", "/s-l1600", url)
+    except Exception:
+        return url
+    return url
+
+def extract_hd_image_from_listing_html(html: str) -> Optional[str]:
+    if not html:
+        return None
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        # Prefer explicit meta/link tags
+        candidates = []
+        og = soup.find("meta", attrs={"property": "og:image"})
+        if og and og.get("content"):
+            candidates.append(og.get("content"))
+        tw = soup.find("meta", attrs={"name": "twitter:image"})
+        if tw and tw.get("content"):
+            candidates.append(tw.get("content"))
+        link_img = soup.find("link", attrs={"rel": ["image_src", "preload", "canonical"]})
+        if link_img and link_img.get("href"):
+            candidates.append(link_img.get("href"))
+
+        for c in candidates:
+            if c and "i.ebayimg.com" in c:
+                return c
+
+        # Fallback: regex scan for any i.ebayimg.com URL in the HTML
+        matches = re.findall(r"https?://i\\.ebayimg\\.com/[^'\"<>\\s]+", html)
+        if not matches:
+            return None
+        # Prefer URLs that already contain s-l size token
+        for m in matches:
+            if "/s-l" in m:
+                return m
+        return matches[0]
+    except Exception:
+        return None
+
+async def enrich_records_with_hd_images(records: List[Dict], max_concurrency: int = 8, max_items: int = 200):
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def _enrich(rec: Dict):
+        if not rec or rec.get("image_hd_url"):
+            return
+        post_url = rec.get("post_url")
+        if not post_url:
+            return
+        async with sem:
+            html = await httpx_get_content(url=post_url)
+            if not html:
+                return
+            hd = extract_hd_image_from_listing_html(html)
+            if hd:
+                rec["image_hd_url"] = upgrade_ebay_img_to_hd(hd)
+
+    # Limit scope to avoid too many requests
+    work = [r for r in records if r and r.get("post_url")][: max(0, max_items)]
+    await asyncio.gather(*[ _enrich(r) for r in work ])
 
 async def get_ebay_page_count(query: str, region: Region | str) -> int:
     region_str = _region_code(region)
