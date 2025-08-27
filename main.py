@@ -1,11 +1,25 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from src.api.v1 import router as v1_endpoint
+from src.scheduler.cronjob import start_ebay_cronjob, stop_ebay_cronjob
+import atexit
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    print("🕐 Starting eBay cronjob scheduler...")
+    start_ebay_cronjob()
+    yield
+    # Shutdown
+    print("🛑 Stopping eBay cronjob scheduler...")
+    stop_ebay_cronjob()
 
 app = FastAPI(
     title="API",
     description="Chaamo API",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 origins = ["*"]
@@ -43,4 +57,3 @@ except Exception as e:
 
 # To run this application for development:
 # uvicorn main:app --reload
-

@@ -63,7 +63,16 @@ def _build_referer(url: str, params: dict[str, str]) -> str:
     except Exception:
         return url
 
-async def httpx_get_content(url: str, params: Optional[dict[str, str]] = None, headers: Optional[dict[str, str]] = None) -> str:
+async def httpx_get_content(
+    url: str,
+    params: Optional[dict[str, str]] = None,
+    headers: Optional[dict[str, str]] = None,
+    *,
+    attempts: int = 5,
+    request_timeout: float = 25.0,
+    jitter_min: float = 0.6,
+    jitter_max: float = 1.5,
+) -> str:
     if params is None:
         params = {}
     if headers is None:
@@ -79,14 +88,16 @@ async def httpx_get_content(url: str, params: Optional[dict[str, str]] = None, h
         pass
 
     # Small human-like jitter
-    await asyncio.sleep(random.uniform(0.6, 1.5))
+    try:
+        await asyncio.sleep(random.uniform(float(jitter_min), float(jitter_max)))
+    except Exception:
+        await asyncio.sleep(0.5)
 
     # Simple retry with backoff and UA rotation
-    attempts = 5
     # Create a single client per call to persist cookies across retries
     use_http2 = bool(random.getrandbits(1))
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=10, keepalive_expiry=30.0)
-    async with httpx.AsyncClient(headers=headers, follow_redirects=True, http2=use_http2, timeout=httpx.Timeout(25.0), limits=limits, trust_env=True) as client:
+    async with httpx.AsyncClient(headers=headers, follow_redirects=True, http2=use_http2, timeout=httpx.Timeout(float(request_timeout)), limits=limits, trust_env=True) as client:
         for attempt in range(1, attempts + 1):
             try:
                 req = client.build_request('GET', url, params=params, headers=headers)

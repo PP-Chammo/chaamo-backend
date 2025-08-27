@@ -17,11 +17,20 @@ async def search_endpoint(
     category_id: Optional[CategoryId] = Query(None, description="Category filter - REQUIRED when using 'query'. Choose from available categories."),
     query: Optional[str] = Query(None, description="Search keyword (e.g., '2023 Topps Merlin Lamine Yamal'). Must be used WITH category_id."),
     user_card_id: Optional[str] = Query(None, description="Alternative to query+category_id: Use existing user card ID from user_cards table."),
+    max_pages: int = Query(50, description="Performance: number of max pages to be scrape (lower is faster)"),
+    page_retries: int = Query(5, description="Performance: number of retry attempts per page (lower is faster)"),
 ):
     try:
         # Add timeout to prevent hanging
         result = await asyncio.wait_for(
-            ebay_scrape_handler(region, category_id, query, user_card_id),
+            ebay_scrape_handler(
+                region,
+                category_id,
+                query,
+                user_card_id,
+                max_pages=max_pages,
+                page_retries=page_retries,
+            ),
             timeout=120.0  # 2 minutes timeout
         )
         return result

@@ -12,7 +12,14 @@ from src.utils.supabase import supabase
 from src.utils.httpx import httpx_get_content
 
 # ---------------- Main scraper ----------------
-async def ebay_scrape_handler(region: Region, category_id: Optional[CategoryId] = None, query: Optional[str] = None, user_card_id: Optional[str] = None):
+async def ebay_scrape_handler(
+    region: Region,
+    category_id: Optional[CategoryId] = None,
+    query: Optional[str] = None,
+    user_card_id: Optional[str] = None,
+    max_pages: int = 50,
+    page_retries: int = 5,
+):
     region_str = _region_code(region)
     base_url = f"{base_target_url[region_str]}/sch/i.html"
 
@@ -32,20 +39,27 @@ async def ebay_scrape_handler(region: Region, category_id: Optional[CategoryId] 
                 user_card_category_id = data[0].get("category_id")
         except Exception as e:
             print(f"⚠️ Failed to fetch master_card_id from user_cards: {e}")
-    
+
     # Use provided category_id or fallback to user_card's category_id
     effective_category_id = category_id.value if category_id else user_card_category_id
 
-    # get total pages
+    # determine total pages. If max_pages provided, skip expensive count call
     try:
-        total_pages = await get_ebay_page_count(effective_query, region_str)
-    except Exception as e:
-        print(f"❌ Error getting page count: {e}")
-        total_pages = 1
+        mp = int(max_pages)
+    except Exception:
+        mp = 1
+    if mp and mp >= 1:
+        total_pages = mp
+    else:
+        try:
+            total_pages = await get_ebay_page_count(effective_query, region_str)
+        except Exception as e:
+            print(f"❌ Error getting page count: {e}")
+            total_pages = 1
 
     # scrape pages in parallel with retry
     tasks = [
-        scrape_page_with_retry(page, total_pages, base_url, effective_query, mc_id, effective_category_id, region_str)
+        scrape_page_with_retry(page, total_pages, base_url, effective_query, mc_id, effective_category_id, region_str, retries=page_retries)
         for page in range(1, total_pages + 1)
     ]
     results = await asyncio.gather(*tasks)
@@ -68,11 +82,13 @@ async def ebay_scrape_handler(region: Region, category_id: Optional[CategoryId] 
                 print(f"❌ Failed to log failed scrape: {e}")
         return {"total": 0, "result": []}
 
-    # Enrich a subset with HD images from listing pages to improve quality
-    try:
-        await enrich_records_with_hd_images(total_result, max_concurrency=10, max_items=200)
-    except Exception as e:
-        print(f"⚠️ Image enrichment step failed: {e}")
+    # Enrich a subset with HD images from listing pages to improve quality (disabled by default)
+    enable_hd_enrich = False
+    if enable_hd_enrich:
+        try:
+            await enrich_records_with_hd_images(total_result, max_concurrency=10, max_items=200)
+        except Exception as e:
+            print(f"⚠️ Image enrichment step failed: {e}")
 
     # Upsert in batches to avoid statement timeouts
     try:
@@ -99,8 +115,7 @@ async def ebay_scrape_handler(region: Region, category_id: Optional[CategoryId] 
 
 
 # ---------------- Page scraper with retry ----------------
-async def scrape_page_with_retry(page, total_pages, base_url, query, mc_id, category_id, region_str):
-    retries = 5
+async def scrape_page_with_retry(page, total_pages, base_url, query, mc_id, category_id, region_str, retries: int = 5):
     for attempt in range(1, retries + 1):
         try:
             print(f"Scraping page {page}/{total_pages} (attempt {attempt}) ...")
@@ -116,7 +131,14 @@ async def scrape_page_with_retry(page, total_pages, base_url, query, mc_id, cate
                 "_pgn": page,
                 "_sop": 13
             }
-            html_text = await httpx_get_content(url=base_url, params=params)
+            html_text = await httpx_get_content(
+                url=base_url,
+                params=params,
+                attempts=retries,
+                request_timeout=10.0,
+                jitter_min=0.2,
+                jitter_max=0.6,
+            )
             if not html_text:
                 raise ValueError("Empty HTML content")
 
