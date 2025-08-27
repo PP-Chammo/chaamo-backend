@@ -6,20 +6,22 @@ from starlette.responses import RedirectResponse
 
 from src.handlers.ebay_scrape import ebay_scrape_handler
 from src.models.ebay import Region
+from src.models.category import CategoryId
 from src.utils.paypal import create_order, capture_order
 
 router = APIRouter()
 
-@router.get("/ebay_scrape",  summary="Scrape eBay sold posts")
+@router.get("/ebay_scrape", summary="Scrape eBay sold posts")
 async def search_endpoint(
     region: Region = Query(Region.uk, description="Choose a region from 'us' or 'uk'"),
-    query: Optional[str] = Query(None, description="Enter keyword. For example: '2023 Topps Merlin Lamine Yamal'"),
-    user_card_id: Optional[str] = Query(None, description="(Optional) can get id from user_cards table")
+    category_id: Optional[CategoryId] = Query(None, description="Category filter - REQUIRED when using 'query'. Choose from available categories."),
+    query: Optional[str] = Query(None, description="Search keyword (e.g., '2023 Topps Merlin Lamine Yamal'). Must be used WITH category_id."),
+    user_card_id: Optional[str] = Query(None, description="Alternative to query+category_id: Use existing user card ID from user_cards table."),
 ):
     try:
         # Add timeout to prevent hanging
         result = await asyncio.wait_for(
-            ebay_scrape_handler(region, query, user_card_id),
+            ebay_scrape_handler(region, category_id, query, user_card_id),
             timeout=120.0  # 2 minutes timeout
         )
         return result

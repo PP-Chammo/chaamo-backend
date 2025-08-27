@@ -2,6 +2,7 @@ import math
 import re
 import asyncio
 from typing import Optional, List, Dict
+from src.models.category import CategoryId
 from bs4 import BeautifulSoup
 import dateutil.parser as date_parser
 import pytz
@@ -11,7 +12,7 @@ from src.utils.supabase import supabase
 from src.utils.httpx import httpx_get_content
 
 # ---------------- Main scraper ----------------
-async def ebay_scrape_handler(region: Region, query: Optional[str] = None, user_card_id: Optional[str] = None):
+async def ebay_scrape_handler(region: Region, category_id: Optional[CategoryId] = None, query: Optional[str] = None, user_card_id: Optional[str] = None):
     region_str = _region_code(region)
     base_url = f"{base_target_url[region_str]}/sch/i.html"
 
@@ -21,16 +22,19 @@ async def ebay_scrape_handler(region: Region, query: Optional[str] = None, user_
 
     # fetch master_card_id once
     mc_id = None
-    category_id = None
+    user_card_category_id = category_id
     if user_card_id and supabase:
         try:
             sel = supabase.table("user_cards").select("master_card_id, category_id").eq("id", user_card_id).limit(1).execute()
             data = getattr(sel, "data", None) or []
             if data:
                 mc_id = data[0].get("master_card_id")
-                category_id = data[0].get("category_id")
+                user_card_category_id = data[0].get("category_id")
         except Exception as e:
             print(f"⚠️ Failed to fetch master_card_id from user_cards: {e}")
+    
+    # Use provided category_id or fallback to user_card's category_id
+    effective_category_id = category_id.value if category_id else user_card_category_id
 
     # get total pages
     try:
@@ -41,7 +45,7 @@ async def ebay_scrape_handler(region: Region, query: Optional[str] = None, user_
 
     # scrape pages in parallel with retry
     tasks = [
-        scrape_page_with_retry(page, total_pages, base_url, effective_query, mc_id, category_id, region_str)
+        scrape_page_with_retry(page, total_pages, base_url, effective_query, mc_id, effective_category_id, region_str)
         for page in range(1, total_pages + 1)
     ]
     results = await asyncio.gather(*tasks)
