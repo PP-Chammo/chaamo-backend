@@ -110,16 +110,18 @@ class EbayCronJob:
     def start_scheduler(self):
         """Start the cron scheduler"""
         # Run daily at 3 AM server time
+        hour = 3
+        minute = 0
         self.scheduler.add_job(
             self.run_scrape_batch,
-            CronTrigger(hour=3, minute=0),
+            CronTrigger(hour=hour, minute=minute),
             id='ebay_scrape_job',
             name='Daily eBay Scrape',
             replace_existing=True
         )
         
         self.scheduler.start()
-        logger.info(f"eBay scrape scheduler started - runs daily at {CronTrigger(hour=16, minute=5)} server time")
+        logger.info(f"eBay scrape scheduler started - runs daily at {hour}:{minute} server time")
     
     def stop_scheduler(self):
         """Stop the scheduler"""
