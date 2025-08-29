@@ -9,7 +9,11 @@ PAYPAL_ENV = os.environ.get("PAYPAL_ENV", "sandbox").lower()
 
 
 def _api_base() -> str:
-    return "https://api-m.paypal.com" if PAYPAL_ENV == "live" else "https://api-m.sandbox.paypal.com"
+    return (
+        "https://api-m.paypal.com"
+        if PAYPAL_ENV == "live"
+        else "https://api-m.sandbox.paypal.com"
+    )
 
 
 def _get_credentials() -> Tuple[str, str]:
@@ -41,7 +45,9 @@ async def get_access_token() -> str:
             except Exception:
                 err = {"error": resp.text[:500]}
             raise httpx.HTTPStatusError(
-                f"PayPal token error {resp.status_code}: {err}", request=resp.request, response=resp
+                f"PayPal token error {resp.status_code}: {err}",
+                request=resp.request,
+                response=resp,
             )
         data = resp.json()
         return data["access_token"]

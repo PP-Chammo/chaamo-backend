@@ -1,35 +1,54 @@
-import os
-from dotenv import load_dotenv
-from supabase import create_client, Client
-from typing import Optional
+"""Clean Supabase client configuration and connection management."""
 
+import os
+from supabase import create_client, Client
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
 load_dotenv()
 
-url: Optional[str] = os.environ.get("SUPABASE_URL")
-key: Optional[str] = os.environ.get("SUPABASE_SERVICE_KEY")
 
-if not url or not key:
-    raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables are required")
+def _get_supabase_credentials() -> tuple[str, str]:
+    """Get and validate Supabase credentials from environment."""
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_KEY")
 
-print("🔧 Initializing Supabase connection...")
-print(f"   🌐 URL: {url}")
-print(f"   🔑 Key: {key[:20]}..." if len(key) > 20 else f"   🔑 Key: {key}")
+    if not url or not key:
+        raise ValueError(
+            "SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables are required"
+        )
 
-supabase: Optional[Client] = None
+    return url, key
 
-try:
-    supabase = create_client(url, key)
-    print("✅ Successfully created Supabase client")
+
+def _create_supabase_client() -> Client:
+    """Create and test Supabase client connection."""
+    url, key = _get_supabase_credentials()
+
+    from src.utils.logger import setup_logger
+
+    logger = setup_logger("chaamo.supabase")
+
+    logger.info("🔧 Initializing Supabase connection...")
+    logger.info(f"   🌐 URL: {url}")
+    logger.info(f"   🔑 Key: {key[:20]}...")
 
     try:
-        print("🔍 Testing Supabase connection...")
-        test_response = supabase.table('categories').select('id').limit(1).execute()
-        print("✅ Supabase connection test successful")
-        print(f"   📊 Test query returned: {len(test_response.data)} rows")
-    except Exception as test_error:
-        print(f"⚠️  WARNING: Supabase connection test failed: {test_error}")
-        print("   The client was created but may not be fully functional")
+        client = create_client(url, key)
+        logger.info("✅ Successfully created Supabase client")
 
-except Exception as e:
-    print(f"❌ ERROR connecting to Supabase: {e}")
-    print(f"   Error type: {type(e).__name__}")
+        # Test connection
+        logger.info("🔍 Testing Supabase connection...")
+        test_query = client.table("categories").select("id").limit(1).execute()
+        logger.info("✅ Supabase connection test successful")
+        logger.info(f"   📊 Test query returned: {len(test_query.data)} rows")
+
+        return client
+
+    except Exception as e:
+        logger.error(f"❌ Supabase connection failed: {e}")
+        raise
+
+
+# Global Supabase client instance
+supabase: Client = _create_supabase_client()
