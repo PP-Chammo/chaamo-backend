@@ -207,6 +207,41 @@ async def start_scrape_worker(
         raise HTTPException(status_code=500, detail=f"Failed to start worker: {str(e)}")
 
 
+@router.get(
+    "/ebay_scrape",
+    summary="Start eBay scraping worker (GET version)",
+    response_model=ScrapeStartResponse,
+)
+async def start_scrape_worker_get(
+    region: Region = Query(Region.uk, description="Choose a region from 'us' or 'uk'"),
+    category_id: Optional[CategoryId] = Query(
+        None, description="Category filter - Required when using 'query', resolved automatically for 'user_card_id'"
+    ),
+    query: Optional[str] = Query(
+        None, description="Search keyword (e.g., '2023 Topps Merlin Lamine Yamal')"
+    ),
+    user_card_id: Optional[str] = Query(
+        None,
+        description="Alternative to query: Use existing user card ID from user_cards table",
+    ),
+    max_pages: int = Query(50, description="Max pages to scrape (lower is faster)"),
+    disable_proxy: bool = Query(False, description="Disable proxy usage (default: False - uses Zyte proxy)"),
+    manager=Depends(get_worker_manager),
+):
+    """GET version: Start a background eBay scraping worker and return task ID."""
+    
+    # Call the existing POST endpoint logic
+    return await start_scrape_worker(
+        region=region,
+        category_id=category_id,
+        query=query,
+        user_card_id=user_card_id,
+        max_pages=max_pages,
+        disable_proxy=disable_proxy,
+        manager=manager,
+    )
+
+
 # -----------------------------
 # PayPal Checkout Endpoints
 # Keep paths as /api/v1/paypal/...

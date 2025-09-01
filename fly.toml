@@ -21,6 +21,8 @@ primary_region = "lhr"
     timeout = "2s"
     grace_period = "10s"
     restart_limit = 0
+    method = "GET"
+    path = "/health"
 
 [deploy]
   strategy = "immediate"

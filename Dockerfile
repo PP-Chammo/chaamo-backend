@@ -46,6 +46,10 @@ RUN apt-get update && apt-get install -y \
     libxcb-util1 \
     && rm -rf /var/lib/apt/lists/*
 
+# Copy and install Zyte CA certificate
+COPY zyte-ca.crt /usr/local/share/ca-certificates/zyte-ca.crt
+RUN update-ca-certificates
+
 # Set working directory
 WORKDIR /app
 
@@ -70,4 +74,4 @@ HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/ || exit 1
 
 # Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--log-config", "logging_config.json"]

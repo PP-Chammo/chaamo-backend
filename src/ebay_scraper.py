@@ -34,16 +34,18 @@ def get_condition_and_grade(title: str):
     condition = "raw"
     grading_company = None
     grade = None
-    
+
     for company in grading_companies:
         if company in (title or "").upper():
             condition = "graded"
             grading_company = company
-            m = re.search(rf"{company} ?([0-9]{{1,2}}(?:\.[0-9])?)", (title or "").upper())
+            m = re.search(
+                rf"{company} ?([0-9]{{1,2}}(?:\.[0-9])?)", (title or "").upper()
+            )
             if m:
                 grade = float(m.group(1))
             break
-    
+
     return condition, grading_company, grade
 
 
@@ -51,16 +53,16 @@ def _normalize_name(name: str) -> str:
     """Normalize card name for search/matching."""
     if not name:
         return ""
-    
+
     # Convert to lowercase and remove extra spaces
-    normalized = re.sub(r'\s+', ' ', name.lower().strip())
-    
+    normalized = re.sub(r"\s+", " ", name.lower().strip())
+
     # Remove common symbols and punctuation
-    normalized = re.sub(r'[^\w\s]', ' ', normalized)
-    
+    normalized = re.sub(r"[^\w\s]", " ", normalized)
+
     # Remove extra spaces again after symbol removal
-    normalized = re.sub(r'\s+', ' ', normalized).strip()
-    
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
     return normalized
 
 
@@ -116,6 +118,78 @@ def _build_search_params(config: Dict, page: int) -> Dict:
 # ==============================================================================
 # DATA EXTRACTION FUNCTIONS (Called by scraping functions)
 # ==============================================================================
+
+
+def _smart_extract_tags_from_title(title: str) -> List[str]:
+    """Extract meaningful words directly from title as tags."""
+    if not title:
+        return []
+
+    # Category/franchise names that should always be included (from categories table)
+    important_categories = {
+        'topps', 'panini', 'futera', 'pokemon', 'pokémon', 'dc', 'fortnite', 'marvel',
+        'digimon', 'wrestling', 'yugioh', 'yu-gi-oh', 'lorcana', 'garbage', 'pail', 'kids'
+    }
+    
+    # Generic stop words to exclude
+    stop_words = {
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with',
+        'by', 'from', 'up', 'about', 'into', 'through', 'during', 'before', 'after',
+        'above', 'below', 'between', 'among', 'throughout', 'despite', 'towards', 'upon',
+        'concerning', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has',
+        'had', 'do', 'does', 'did', 'will', 'would', 'should', 'could', 'can', 'may',
+        'might', 'must', 'shall', 'this', 'that', 'these', 'those', 'i', 'you', 'he',
+        'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your',
+        'his', 'her', 'its', 'our', 'their', 'card', 'cards', 'trading', 'sports',
+        'collectible', 'collectibles', 'mint', 'condition', 'nm', 'ex', 'vg', 'poor',
+        'lot', 'set', 'pack', 'box', 'case', 'sealed', 'new', 'used', 'vintage',
+        'tcg', 'ccg', 'game', 'games', 'trading_cards', 'ebay'
+    }
+
+    # Clean the title and split into words
+    import re
+    # Remove special characters but keep alphanumeric, spaces, and hyphens
+    cleaned_title = re.sub(r'[^\w\s\-]', ' ', title)
+    words = cleaned_title.lower().split()
+    
+    meaningful_tags = []
+    
+    for word in words:
+        word = word.strip('-').strip()  # Remove leading/trailing hyphens and spaces
+        
+        # Skip if empty or too short
+        if not word or len(word) < 2:
+            continue
+        
+        # Always include important category/franchise names
+        if word in important_categories:
+            meaningful_tags.append(word)
+            continue
+            
+        # Skip generic stop words
+        if word in stop_words:
+            continue
+            
+        # Include years (4 digits starting with 19 or 20)
+        if re.match(r'^(19|20)\d{2}$', word):
+            meaningful_tags.append(word)
+            continue
+            
+        # Include meaningful words (3+ chars, not all digits unless it's a year)
+        if len(word) >= 3:
+            # Skip pure numbers unless they're years
+            if word.isdigit() and not re.match(r'^(19|20)\d{2}$', word):
+                continue
+            meaningful_tags.append(word)
+        
+        # Include 2-char words that might be meaningful (like abbreviations)
+        elif len(word) == 2 and not word.isdigit():
+            meaningful_tags.append(word)
+    
+    # Remove duplicates and limit to top 8 most meaningful tags
+    unique_tags = list(dict.fromkeys(meaningful_tags))  # Preserve order while removing duplicates
+    
+    return unique_tags[:8]
 
 
 def _extract_item_data(item, config: Dict) -> Optional[Dict]:
@@ -229,12 +303,20 @@ def _extract_item_data(item, config: Dict) -> Optional[Dict]:
     master_card_id = None
     if config.get("user_card_id"):
         try:
-            response = supabase.table("user_cards").select("master_card_id").eq("id", config["user_card_id"]).execute()
+            response = (
+                supabase.table("user_cards")
+                .select("master_card_id")
+                .eq("id", config["user_card_id"])
+                .execute()
+            )
             if response.data:
                 master_card_id = response.data[0].get("master_card_id")
         except Exception:
             # If query fails, keep master_card_id as None
             pass
+
+    # Extract smart tags from title
+    tags = _smart_extract_tags_from_title(title)
 
     return {
         "id": listing_id,
@@ -254,6 +336,9 @@ def _extract_item_data(item, config: Dict) -> Optional[Dict]:
         "normalised_name": _normalize_name(title),
         "category_id": config["category_id"],
         "image_hd_url": image_hd_url,
+        "tags": tags,
+        "created_at": None,  # Will be set by database default
+        "updated_at": None,  # Will be handled by upsert logic
     }
 
 
@@ -264,8 +349,6 @@ def _parse_page_items(html: str, config: Dict) -> List[Dict]:
     items = soup.select("li[data-listingid]")
     records = []
 
-    scraper_logger.info(f"🔍 Found {len(items)} product items with listing IDs")
-
     for item in items:
         try:
             record = _extract_item_data(item, config)
@@ -275,7 +358,6 @@ def _parse_page_items(html: str, config: Dict) -> List[Dict]:
             scraper_logger.warning(f"⚠️ Failed to extract item data: {e}")
             continue
 
-    scraper_logger.info(f"✅ Successfully extracted {len(records)} valid records")
     return records
 
 
@@ -287,50 +369,40 @@ def _parse_page_items(html: str, config: Dict) -> List[Dict]:
 def _upsert_records_batch(records: List[Dict], user_card_id: Optional[str]):
     """Insert records into the ebay_posts table, avoiding eBay ID reuse conflicts."""
     batch_size = 1000
+    from datetime import datetime
 
     for i in range(0, len(records), batch_size):
         batch = records[i : i + batch_size]
 
-        # Add user_card_id if provided
+        # Add user_card_id to user_card_ids array if provided (for user_card_id mode)
         if user_card_id:
             for record in batch:
-                record["user_card_id"] = user_card_id
+                record["user_card_ids"] = [
+                    user_card_id
+                ]  # Array with single user_card_id
+
+        # Set updated_at for all records
+        current_time = datetime.utcnow().isoformat()
+        for record in batch:
+            record["updated_at"] = current_time
 
         try:
-            scraper_logger.info(f"💾 Inserting {len(batch)} records to ebay_posts table")
-            # Use insert instead of upsert to handle eBay ID reuse
-            # eBay reuses listing IDs across different auctions, so we want separate records
-            supabase.table("ebay_posts").insert(batch, returning="minimal").execute()
-            scraper_logger.info(f"✅ Successfully inserted {len(batch)} records to ebay_posts")
+            # Use upsert to handle both insert and update cases
+            supabase.table("ebay_posts").upsert(
+                batch, on_conflict="id", returning="minimal"
+            ).execute()
+            scraper_logger.info(f"✅ successfully upsert {len(batch)} records")
         except Exception as e:
-            from src.utils.logger import log_error_with_context
-
-            log_error_with_context(scraper_logger, e, f"batch insert to ebay_posts ({len(batch)} records)")
-            scraper_logger.error(f"❌ Failed to insert {len(batch)} records to ebay_posts: {str(e)}")
-            
-            # If insert fails due to duplicate, try with upsert as fallback
-            if "duplicate" in str(e).lower() or "unique" in str(e).lower():
-                scraper_logger.warning("🔄 Duplicate detected, using upsert with composite key")
-                try:
-                    # Add timestamp to make record unique
-                    from datetime import datetime
-                    current_time = datetime.utcnow().isoformat()
-                    
-                    for record in batch:
-                        record["scraped_at"] = current_time
-                    
-                    supabase.table("ebay_posts").upsert(batch, on_conflict="id,price,sold_at").execute()
-                    scraper_logger.info(f"✅ Successfully upserted {len(batch)} records with composite key")
-                except Exception as fallback_error:
-                    scraper_logger.error(f"❌ Fallback upsert also failed: {str(fallback_error)}")
-                    raise
-            else:
-                raise  # Re-raise to ensure the error propagates
+            scraper_logger.error(f"❌ Upsert failed: {str(e)}")
+            raise
 
 
-async def _update_user_card(records: List[Dict], user_card_id: str):
-    """Update user card with latest sold information."""
+async def _update_user_card_simple(records: List[Dict], user_card_id: str):
+    """Update user card with latest sold information (simple mode for query + category_id)."""
     try:
+        if not records:
+            return
+
         latest = max(records, key=lambda r: _safe_parse_date(r.get("sold_at")))
 
         update_data = {
@@ -344,10 +416,34 @@ async def _update_user_card(records: List[Dict], user_card_id: str):
             "id", user_card_id
         ).execute()
 
+        scraper_logger.info(
+            f"✅ Updated user_card {user_card_id} (simple mode): "
+            f"price={latest.get('price')}, currency={latest.get('currency')}"
+        )
+
     except Exception as e:
         from src.utils.logger import log_error_with_context
 
-        log_error_with_context(scraper_logger, e, "updating user card")
+        log_error_with_context(scraper_logger, e, "updating user card (simple mode)")
+
+
+async def _update_user_card_deterministic(
+    records: List[Dict], user_card_id: str, query: str
+):
+    """Update user card using deterministic matching engine (user_card_id mode only)."""
+    try:
+        from src.match_engine import deterministic_match_and_update
+
+        # Use deterministic matching for user_card_id mode
+        result = deterministic_match_and_update(user_card_id, query, records)
+        return result
+
+    except Exception as e:
+        from src.utils.logger import log_error_with_context
+
+        log_error_with_context(
+            scraper_logger, e, "updating user card with deterministic matching"
+        )
 
 
 async def _handle_failed_scrape(config: Dict):
@@ -385,16 +481,12 @@ async def _handle_failed_scrape(config: Dict):
 
 def _resolve_scrape_params(
     query: Optional[str], category_id: Optional[CategoryId], user_card_id: Optional[str]
-) -> tuple[str, CategoryId, Optional[str]]:
+) -> tuple[str, CategoryId, Optional[str], bool]:
     """Resolve final query and category_id from either direct params or user_card_id.
-    Returns: (final_query, final_category_id, master_card_id)
+    Returns: (final_query, final_category_id, master_card_id, is_user_card_mode)
     """
 
-    # Mode 1: Direct query + category_id provided
-    if query and category_id:
-        return query, category_id, None
-
-    # Mode 2: user_card_id provided - resolve from database
+    # Mode 2: user_card_id provided - resolve from database (check this first!)
     if user_card_id:
         try:
             response = (
@@ -417,7 +509,7 @@ def _resolve_scrape_params(
                 scraper_logger.info(
                     f"✅ Resolved user_card_id {user_card_id[:8]}... to query: '{resolved_query}', category: {resolved_category.value if hasattr(resolved_category, 'value') else resolved_category}"
                 )
-                return resolved_query, resolved_category, master_card_id
+                return resolved_query, resolved_category, master_card_id, True
             else:
                 scraper_logger.warning(
                     f"⚠️ User card {user_card_id} not found, using fallback"
@@ -425,10 +517,14 @@ def _resolve_scrape_params(
         except Exception as e:
             scraper_logger.warning(f"⚠️ Error resolving user card {user_card_id}: {e}")
 
+    # Mode 1: Direct query + category_id provided (only if no user_card_id)
+    if query and category_id:
+        return query, category_id, None, False
+
     # Fallback: use provided params or defaults
     final_query = query or "card"
     final_category = category_id or CategoryId.PANINI
-    return final_query, final_category, None
+    return final_query, final_category, None, False
 
 
 def _setup_scrape_config(
@@ -437,6 +533,7 @@ def _setup_scrape_config(
     category_id: CategoryId,
     user_card_id: Optional[str],
     master_card_id: Optional[str] = None,
+    is_user_card_mode: bool = False,
 ) -> Dict:
     """Setup scraping configuration with resolved parameters."""
     config = {
@@ -447,6 +544,7 @@ def _setup_scrape_config(
         "user_card_id": user_card_id,
         "base_url": f"{base_target_url[region.value]}/sch/i.html",
         "master_card_id": master_card_id,
+        "is_user_card_mode": is_user_card_mode,
     }
 
     return config
@@ -457,7 +555,9 @@ def _setup_scrape_config(
 # ==============================================================================
 
 
-async def _scrape_single_page(config: Dict, page: int, max_retries: int, disable_proxy: bool = False) -> List[Dict]:
+async def _scrape_single_page(
+    config: Dict, page: int, max_retries: int, disable_proxy: bool = False
+) -> List[Dict]:
     """Scrape a single page with retry logic."""
     for attempt in range(1, max_retries + 1):
         try:
@@ -491,7 +591,9 @@ async def _scrape_single_page(config: Dict, page: int, max_retries: int, disable
     return []
 
 
-async def _scrape_all_pages(config: Dict, total_pages: int, retries: int, disable_proxy: bool = False) -> List[Dict]:
+async def _scrape_all_pages(
+    config: Dict, total_pages: int, retries: int, disable_proxy: bool = False
+) -> List[Dict]:
     """Scrape all pages concurrently with proper delays."""
     all_records = []
 
@@ -568,17 +670,29 @@ def _process_records(records: List[Dict], config: Dict) -> List[Dict]:
 
 
 async def _save_results(records: List[Dict], config: Dict):
-    """Save results to database and update user card."""
+    """Save results to database and update user card with mode-appropriate logic."""
     if not records:
         await _handle_failed_scrape(config)
         return
 
-    # Batch upsert records
-    # _upsert_records_batch(records, config["user_card_id"])
+    # Batch upsert records  
+    _upsert_records_batch(records, config["user_card_id"])
 
-    # Update user card with latest sold info
-    if config["user_card_id"]:
-        await _update_user_card(records, config["user_card_id"])
+    # Update user card - use deterministic matching ONLY for user_card_id mode
+    user_card_id = config.get("user_card_id")
+    if user_card_id:
+        # Check if this is user_card_id mode (query was resolved from user_cards.custom_name)
+        # vs query + category_id mode (user_card_id was provided but query was direct)
+        is_user_card_mode = config.get("is_user_card_mode", False)
+
+        if is_user_card_mode:
+            # Mode 2: user_card_id - Use deterministic matching
+            await _update_user_card_deterministic(
+                records, user_card_id, config["query"]
+            )
+        else:
+            # Mode 1: query + category_id - Use simple latest-date logic
+            await _update_user_card_simple(records, user_card_id)
 
 
 # ==============================================================================
@@ -604,21 +718,41 @@ class EbayScraper:
     ) -> Dict:
         """Main scraping function - clean and well-structured."""
 
-        # 1. Setup and validation
-        scrape_config = _setup_scrape_config(region, query, category_id, user_card_id)
-        if "error" in scrape_config:
-            return scrape_config
+        # 1. Resolve parameters and determine mode
+        final_query, final_category_id, master_card_id, is_user_card_mode = (
+            _resolve_scrape_params(query, category_id, user_card_id)
+        )
 
-        # 2. Determine pages to scrape
-        total_pages = min(max_pages, await _get_page_count(scrape_config, disable_proxy))
+        # Log scraping mode
+        mode_type = "user_card_id" if is_user_card_mode else "query+category_id"
+        scraper_logger.info(f"🚀 Scraping started using {mode_type} mode")
+        
+        # 2. Setup configuration with mode detection
+        scrape_config = _setup_scrape_config(
+            region,
+            final_query,
+            final_category_id,
+            user_card_id,
+            master_card_id,
+            is_user_card_mode,
+        )
 
-        # 3. Scrape all pages concurrently for speed
-        all_records = await _scrape_all_pages(scrape_config, total_pages, page_retries, disable_proxy)
+        # 3. Determine pages to scrape
+        total_pages = min(
+            max_pages, await _get_page_count(scrape_config, disable_proxy)
+        )
 
-        # 4. Process and deduplicate results
+        # 4. Scrape all pages concurrently for speed
+        all_records = await _scrape_all_pages(
+            scrape_config, total_pages, page_retries, disable_proxy
+        )
+        scraper_logger.info(f"📦 Found {len(all_records)} product items with listing IDs")
+
+        # 5. Process and deduplicate results
         processed_records = _process_records(all_records, scrape_config)
+        scraper_logger.info(f"✅ Successfully extracted {len(processed_records)} valid records")
 
-        # 5. Save to database and update user card
+        # 6. Save to database and update user card with mode-appropriate logic
         await _save_results(processed_records, scrape_config)
 
         return {"total": len(processed_records), "result": processed_records}
@@ -697,8 +831,8 @@ class EbayWorkerManager:
         task_id = str(uuid.uuid4())
 
         # Resolve final parameters from either mode
-        final_query, final_category_id, master_card_id = _resolve_scrape_params(
-            query, category_id, user_card_id
+        final_query, final_category_id, master_card_id, is_user_card_mode = (
+            _resolve_scrape_params(query, category_id, user_card_id)
         )
 
         task = WorkerTask(

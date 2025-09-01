@@ -35,13 +35,13 @@ def _create_supabase_client() -> Client:
 
     try:
         client = create_client(url, key)
-        logger.info("✅ Successfully created Supabase client")
 
         # Test connection
-        logger.info("🔍 Testing Supabase connection...")
         test_query = client.table("categories").select("id").limit(1).execute()
-        logger.info("✅ Supabase connection test successful")
-        logger.info(f"   📊 Test query returned: {len(test_query.data)} rows")
+        if len(test_query.data) > 0:
+            logger.info("✅ Supabase connection test successful")
+        else:
+            logger.info("❌ Supabase connection test failed")
 
         return client
 

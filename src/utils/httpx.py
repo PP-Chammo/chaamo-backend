@@ -6,12 +6,21 @@ import random
 import re
 from typing import Optional
 from urllib.parse import urlencode, urljoin, urlparse
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
 
 import httpx
 
 from src.utils.logger import get_logger
 
 logger = get_logger("httpx")
+
+load_dotenv()
+
+# Disable verbose httpx logging to prevent spam
+import logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Modern browser user agents for anti-bot measures
 USER_AGENTS = [
@@ -40,8 +49,8 @@ ACCEPT_LANGUAGES = [
 ]
 
 # Zyte API configuration
-ZYTE_API_KEY = os.getenv("ZYTE_API_ACCESS")
-ZYTE_PROXY_URL = "http://api.zyte.com:8011"
+ZYTE_API_KEY = os.environ.get("ZYTE_API_ACCESS")
+ZYTE_PROXY_URL = os.environ.get("ZYTE_PROXY_URL")
 
 # Elite proxy servers - tested and working for eBay scraping
 PROXY_LIST = [
@@ -106,18 +115,12 @@ def get_zyte_proxy() -> Optional[str]:
         logger.warning("🔑 Zyte API key not found in environment")
         return None
     
-    # Zyte proxy format: http://api_key:@proxy-host:port
-    return f"http://{ZYTE_API_KEY}:@api.zyte.com:8011"
+    # Zyte proxy format: http://api_key:@api.zyte.com:8011/
+    return f"http://{ZYTE_API_KEY}:@{ZYTE_PROXY_URL}/"
 
 
 def get_random_proxy() -> Optional[str]:
-    """Get proxy - prioritize Zyte, fallback to proxy list."""
-    # Try Zyte first if API key is available
-    zyte_proxy = get_zyte_proxy()
-    if zyte_proxy:
-        logger.info("🟢 Using Zyte proxy")
-        return zyte_proxy
-    
+    """Get traditional proxy URL (excludes Zyte which uses different format)."""
     # Fallback to traditional proxy list
     if not PROXY_LIST:
         logger.info("📡 No proxies available, using direct connection")
@@ -181,21 +184,30 @@ async def httpx_get_content(
     # Try proxy first, fallback to direct if proxy array is empty
     connection_attempts = []
     if use_proxy:
-        proxy_url = get_random_proxy()
-        if proxy_url:
-            connection_attempts.append(("proxy", proxy_url))
-        elif not PROXY_LIST:  # If proxy list is empty, fallback to direct
-            connection_attempts.append(("direct", None))
-            logger.info("🔄 Proxy list is empty, using direct connection fallback")
+        # Try Zyte proxy first if available
+        zyte_proxy = get_zyte_proxy()
+        if zyte_proxy:
+            connection_attempts.append(("zyte", zyte_proxy))
+            logger.info("🟢 Using Zyte proxy")
+        else:
+            # Fallback to traditional proxies
+            proxy_url = get_random_proxy()
+            if proxy_url:
+                connection_attempts.append(("proxy", proxy_url))
+            elif not PROXY_LIST:  # If proxy list is empty, fallback to direct
+                connection_attempts.append(("direct", None))
+                logger.info("🔄 Proxy list is empty, using direct connection fallback")
 
     # If no proxy available but proxy list exists, still try direct as last resort
     if not connection_attempts:
         connection_attempts.append(("direct", None))
         logger.warning("⚠️ No proxies available, falling back to direct connection")
 
-    for connection_type, proxy_url in connection_attempts:
-        if connection_type == "proxy":
-            logger.info(f"🌐 Trying proxy: {proxy_url}")
+    for connection_type, proxy_config in connection_attempts:
+        if connection_type == "zyte":
+            logger.info("🟢 Trying Zyte proxy")
+        elif connection_type == "proxy":
+            logger.info(f"🌐 Trying proxy: {proxy_config}")
         else:
             logger.info(f"🔗 Trying direct connection")
 
@@ -205,12 +217,20 @@ async def httpx_get_content(
         )
 
         try:
-            # Configure SSL verification for proxy connections
+            # Configure SSL verification and proxy settings
             verify_ssl = True
-            if proxy_url and "zyte.com" in proxy_url:
-                # Disable SSL verification for Zyte proxy to avoid certificate issues
-                verify_ssl = False
-                logger.info("🔓 Disabled SSL verification for Zyte proxy")
+            proxy_setting = None
+            
+            if connection_type == "zyte":
+                # Zyte proxy uses CA certificate in production
+                verify_ssl = "/usr/local/share/ca-certificates/zyte-ca.crt" if os.path.exists("/usr/local/share/ca-certificates/zyte-ca.crt") else True
+                proxy_setting = proxy_config  # This is a string URL for Zyte
+                if verify_ssl == True:
+                    logger.info("🔐 Using system SSL verification for Zyte proxy")
+                else:
+                    logger.info("🔐 Using Zyte CA certificate for SSL verification")
+            elif connection_type == "proxy":
+                proxy_setting = proxy_config  # This is a string URL
 
             async with httpx.AsyncClient(
                 headers=headers,
@@ -220,7 +240,7 @@ async def httpx_get_content(
                 limits=limits,
                 trust_env=True,
                 max_redirects=10,
-                proxy=proxy_url,
+                proxy=proxy_setting,
                 verify=verify_ssl,
             ) as client:
                 success = await _attempt_requests(

@@ -82,3 +82,4 @@ docker-compose.override.yml
 .DS_Store
 
 *.html
+zyte-ca.crt
