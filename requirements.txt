@@ -16,13 +16,19 @@ python-dotenv==1.1.1
 python-dateutil==2.9.0.post0
 pytz==2025.2
 
-# Scheduling
-apscheduler==3.10.4
-
-# String matching and ML (for trading card pipeline)
-rapidfuzz==3.6.1
-fuzzywuzzy==0.18.0
-python-Levenshtein==0.21.1
+# Array processing
 numpy==2.1.3
-sentence-transformers==2.2.2
-tf-keras==2.19.0
+
+# Embeddings / local fallback
+sentence-transformers==5.1.0
+torch>=2.1.0           # required by sentence-transformers (CPU/GPU variant). Install appropriate wheel for your platform.
+
+# OpenAI SDK (for text-embedding-3-small, LLM calls)
+openai>=1.0.0,<3.0.0
+
+# Optional / production helpers
+# faiss-cpu may be useful for local vector search (optional, platform-dependent)
+# faiss-cpu==1.7.4
+
+# Testing / dev
+pytest>=8.0.0
