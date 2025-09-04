@@ -223,7 +223,7 @@ async def httpx_get_content(
             
             if connection_type == "zyte":
                 # Zyte proxy uses CA certificate in production
-                verify_ssl = "/usr/local/share/ca-certificates/zyte-ca.crt" if os.path.exists("/usr/local/share/ca-certificates/zyte-ca.crt") else True
+                verify_ssl = "/usr/local/share/ca-certificates/zyte-ca.crt" if os.path.exists("/usr/local/share/ca-certificates/zyte-ca.crt") else False
                 proxy_setting = proxy_config  # This is a string URL for Zyte
                 if verify_ssl == True:
                     logger.info("🔐 Using system SSL verification for Zyte proxy")
