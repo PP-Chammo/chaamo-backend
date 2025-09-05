@@ -1,11 +1,3 @@
-# src/ebay_scraper.py
-"""eBay scraper with 4-step pipeline:
-1) Normalizer
-2) Embedding (OpenAI text-embedding-3-small)
-3) Nearest-neighbor (top-k) + optional GPT rerank (gpt-4o-mini)
-4) Store vectors + upsert to supabase + update user_card (if mode)
-"""
-
 import os
 import asyncio
 import math
@@ -14,11 +6,10 @@ import re
 import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
-from concurrent.futures import ThreadPoolExecutor
-from enum import Enum
-from dataclasses import dataclass
 from urllib.parse import urlencode
 import json
+import unicodedata
+import difflib
 
 import dateutil.parser as date_parser
 import pytz
@@ -30,11 +21,344 @@ from src.models.category import CategoryId
 from src.models.ebay import Region, base_target_url
 from src.utils.httpx import httpx_get_content
 from src.utils.supabase import supabase
-from src.utils.normalizer import normalize_card_title
 
 scraper_logger = get_logger("scraper")
 
+# Try to import rapidfuzz (optional). If available, use it for better fuzzy matching.
+try:
+    from rapidfuzz import process, fuzz  # type: ignore
+
+    _HAS_RAPIDFUZZ = True
+except Exception:
+    _HAS_RAPIDFUZZ = False
+
+# Starter lookups (extend externally if perlu)
+DEFAULT_SET_NAMES = [
+    "Panini Prizm",
+    "Topps Chrome",
+    "Evolving Skies",
+    "Fusion Strike",
+    "Base Set",
+    "Jungle",
+    "Fossil",
+    "Modern Horizons",
+    "Shadowmoor",
+    "Topps Deco",
+    "Topps Finest",
+    "Topps Museum",
+    "Topps Merlin",
+    "Topps Stadium Club",
+    "Topps Superstars",
+    "Topps MLS",
+    "Topps Now",
+    "Topps Bundesliga",
+    "Topps Living Set",
+    "Topps UEFA",
+    "Topps FC Barcelona",
+    "Topps Liverpool",
+    "Topps Arsenal",
+    "Topps Manchester City",
+    "Topps PSG",
+    "Topps Bayern Munich",
+    "Topps Real Madrid",
+    "Topps Argentina",
+]
+
+RARITY_KEYWORDS = [
+    "common",
+    "uncommon",
+    "rare",
+    "ultra rare",
+    "super rare",
+    "secret rare",
+    "holo",
+    "holographic",
+    "holofoil",
+    "foil",
+    "parallel",
+    "first edition",
+    "1st edition",
+    "promo",
+    "limited",
+    "shiny",
+    "vmax",
+    "vstar",
+    "ex",
+    "gx",
+    "ultra",
+    "reverse holo",
+    "reverse-holo",
+]
+
+PARALLEL_KEYWORDS = [
+    "silver",
+    "gold",
+    "prizm",
+    "optic",
+    "rainbow",
+    "chromium",
+    "chrome",
+    "green parallel",
+    "blue parallel",
+]
+
+AUTOGRAPH_KEYWORDS = ["auto", "autograph", "signed", "signature", "certified autograph"]
+RELIC_KEYWORDS = ["relic", "patch", "jersey", "memorabilia", "game used"]
+LANGUAGE_MAP = {
+    "jpn": "Japanese",
+    "japanese": "Japanese",
+    "eng": "English",
+    "english": "English",
+    "kor": "Korean",
+    "korean": "Korean",
+    "ger": "German",
+    "german": "German",
+    "spa": "Spanish",
+    "spanish": "Spanish",
+}
+
+# Regex patterns
+_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+_CARD_NUM_RE = re.compile(r"#\s*([0-9]{1,4}[A-Za-z]?)", re.IGNORECASE)
+_SERIAL_RE = re.compile(r"\b([0-9]{1,4}\s*/\s*[0-9]{1,4})\b")
+_GRADING_RE = re.compile(
+    r"\b(psa|bgs|cgc|sgc|csg|hga|gma)\s*\.?\s*#?\s*([0-9]{1,2}(?:\.\d)?)\b",
+    re.IGNORECASE,
+)
+_GRADING_ONLY_RE = re.compile(r"\b(psa|bgs|cgc|sgc|csg|hga|gma)\b", re.IGNORECASE)
+
+
+# ===============================================================
+# Normalizer functions (moved from normalizer.py)
+# ===============================================================
+
+
+def _normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    # remove accents, lower, keep slash for serials
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    # replace weird punctuation with spaces except slash
+    s = re.sub(r"[^a-z0-9/ ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+# ===============================================================
+# Fuzzy matching helper
+# ===============================================================
+
+
+def _fuzzy_best_match(
+    candidate: str, choices: List[str]
+) -> Tuple[Optional[str], float]:
+    if not candidate or not choices:
+        return None, 0.0
+    if _HAS_RAPIDFUZZ:
+        best = process.extractOne(candidate, choices, scorer=fuzz.token_set_ratio)
+        if best:
+            name, score, _ = best
+            return name, float(score)
+        return None, 0.0
+    else:
+        # difflib fallback (ratio 0..1), convert to 0..100
+        match = difflib.get_close_matches(candidate, choices, n=1, cutoff=0.0)
+        if not match:
+            return None, 0.0
+        best = match[0]
+        score = difflib.SequenceMatcher(a=candidate, b=best).ratio() * 100.0
+        return best, float(score)
+
+
+# ===============================================================
+# Main normalize function
+# ===============================================================
+
+
+def normalize_card_title(
+    title: str, set_names: Optional[List[str]] = None, fuzzy_threshold: float = 75.0
+) -> Dict[str, Any]:
+    """
+    Parse a raw title and return a dict with fixed keys:
+    {
+      year, set, set_score, rarity, parallel, card_number, serial_number,
+      player_or_character, grading, grade, autograph, relic_patch, language,
+      confidence: {field: score 0..1}, raw_title, normalized_title
+    }
+    """
+    if set_names is None:
+        set_names = DEFAULT_SET_NAMES
+
+    raw = title or ""
+    norm = _normalize_text(raw)
+
+    # initialize result with defaults
+    result = {
+        "year": None,
+        "set": None,
+        "set_score": 0.0,
+        "rarity": None,
+        "parallel": None,
+        "card_number": None,
+        "serial_number": None,
+        "player_or_character": None,
+        "grading": None,
+        "grade": None,
+        "autograph": False,
+        "relic_patch": False,
+        "language": None,
+        "confidence": {},
+        "raw_title": raw,
+        "normalized_title": norm,
+    }
+
+    # Year
+    y = _YEAR_RE.search(norm)
+    if y:
+        try:
+            result["year"] = int(y.group())
+            result["confidence"]["year"] = 1.0
+        except Exception:
+            result["confidence"]["year"] = 0.0
+    else:
+        result["confidence"]["year"] = 0.0
+
+    # Serial number (xx/yyy, /25, #123, etc.)
+    serial = _extract_serial_number(raw)
+    if serial:
+        result["serial_number"] = serial
+        result["confidence"]["serial_number"] = 1.0
+        # Remove serial pattern from normalized text for cleaner matching
+        serial_patterns_to_remove = [
+            f"/{serial}",
+            f"#{serial}",
+            f"{serial}/",
+            f" {serial}/",
+        ]
+        for pattern in serial_patterns_to_remove:
+            norm = norm.replace(pattern.lower(), "")
+    else:
+        result["confidence"]["serial_number"] = 0.0
+
+    # Card number (#123)
+    cn = _CARD_NUM_RE.search(raw)
+    if cn:
+        result["card_number"] = cn.group(1)
+        result["confidence"]["card_number"] = 1.0
+        norm = norm.replace(cn.group(0).lower(), "")
+    else:
+        result["confidence"]["card_number"] = 0.0
+
+    # Grading (PSA 10, BGS 9.5 etc)
+    g = _GRADING_RE.search(raw)
+    if g:
+        result["grading"] = g.group(1).upper()
+        try:
+            result["grade"] = float(g.group(2))
+        except:
+            result["grade"] = None
+        result["confidence"]["grading"] = 1.0
+        norm = norm.replace(g.group(0).lower(), "")
+    else:
+        g2 = _GRADING_ONLY_RE.search(raw)
+        if g2:
+            result["grading"] = g2.group(1).upper()
+            result["confidence"]["grading"] = 0.8
+            norm = norm.replace(g2.group(0).lower(), "")
+        else:
+            result["confidence"]["grading"] = 0.0
+
+    # Autograph
+    is_auto = any(tok in norm for tok in AUTOGRAPH_KEYWORDS)
+    result["autograph"] = bool(is_auto)
+    result["confidence"]["autograph"] = 0.95 if is_auto else 0.0
+    if is_auto:
+        for tok in AUTOGRAPH_KEYWORDS:
+            norm = norm.replace(tok, "")
+
+    # Relic/patch
+    is_relic = any(tok in norm for tok in RELIC_KEYWORDS)
+    result["relic_patch"] = bool(is_relic)
+    result["confidence"]["relic_patch"] = 0.95 if is_relic else 0.0
+    if is_relic:
+        for tok in RELIC_KEYWORDS:
+            norm = norm.replace(tok, "")
+
+    # Language
+    found_lang = None
+    for k, v in LANGUAGE_MAP.items():
+        if k in norm:
+            found_lang = v
+            norm = norm.replace(k, "")
+            break
+    result["language"] = found_lang
+    result["confidence"]["language"] = 0.9 if found_lang else 0.0
+
+    # Rarity & Parallel
+    found_rarity = None
+    for r in RARITY_KEYWORDS:
+        if r in norm:
+            found_rarity = r
+            norm = norm.replace(r, "")
+            break
+    result["rarity"] = found_rarity
+    result["confidence"]["rarity"] = 0.95 if found_rarity else 0.0
+
+    found_parallel = None
+    for p in PARALLEL_KEYWORDS:
+        if p in norm:
+            found_parallel = p
+            norm = norm.replace(p, "")
+            break
+    result["parallel"] = found_parallel
+    result["confidence"]["parallel"] = 0.95 if found_parallel else 0.0
+
+    # Set detection: first exact substring match, then fuzzy match
+    found_set = None
+    set_score = 0.0
+
+    # Try direct substring matching first (more precise)
+    for set_name in set_names:
+        if set_name.lower() in norm:
+            found_set = set_name
+            set_score = 1.0
+            norm = norm.replace(set_name.lower(), "")
+            break
+
+    # If no direct match, try fuzzy matching with lower threshold
+    if not found_set:
+        best_name, score = _fuzzy_best_match(norm, set_names)
+        if best_name and score >= 50.0:  # Lowered from 75% to 50%
+            found_set = best_name
+            set_score = score / 100.0
+            norm = norm.replace(best_name.lower(), "")
+        else:
+            set_score = score / 100.0 if best_name else 0.0
+
+    result["set"] = found_set
+    result["set_score"] = set_score
+    result["confidence"]["set"] = set_score
+
+    # Player/character extraction: leftover tokens after removals
+    leftovers = re.sub(
+        r"\b(card|cards|pokemon|pokémon|mtg|yugioh|yu gi oh|yugi)\b", " ", norm
+    )
+    leftovers = re.sub(r"[^a-z0-9 ]", " ", leftovers)
+    leftovers = re.sub(r"\s+", " ", leftovers).strip()
+    result["player_or_character"] = leftovers.title() if leftovers else None
+    result["confidence"]["player_or_character"] = 0.9 if leftovers else 0.0
+
+    # ensure normalized_title updated
+    result["normalized_title"] = _normalize_text(result["raw_title"])
+
+    return result
+
+
+# ===============================================================
 # OpenAI config
+# ===============================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE = os.getenv("OPENAI_BASE", "https://api.openai.com")
 EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
@@ -42,7 +366,11 @@ RERANK_MODEL = os.getenv("OPENAI_RERANK_MODEL", "gpt-4o-mini")
 EMBED_BATCH = int(os.getenv("EMBED_BATCH", "128"))
 
 
-# helper: compute cosine similarity
+# ===============================================================
+# Helper: compute cosine similarity
+# ===============================================================
+
+
 def _cosine_sim(a: List[float], b: List[float]) -> float:
     # returns similarity in [-1..1]
     if not a or not b or len(a) != len(b):
@@ -60,9 +388,11 @@ def _cosine_sim(a: List[float], b: List[float]) -> float:
     return dot / (math.sqrt(na) * math.sqrt(nb))
 
 
-# --------------------------
+# ===============================================================
 # OpenAI helpers (async)
-# --------------------------
+# ===============================================================
+
+
 async def _openai_post(
     path: str, payload: Dict[str, Any], timeout: int = 30
 ) -> Dict[str, Any]:
@@ -79,6 +409,11 @@ async def _openai_post(
         return r.json()
 
 
+# ===============================================================
+# Embed texts using OpenAI
+# ===============================================================
+
+
 async def embed_texts(texts: List[str], model: str = None) -> List[List[float]]:
     model = model or EMBED_MODEL
     if not texts:
@@ -89,6 +424,11 @@ async def embed_texts(texts: List[str], model: str = None) -> List[List[float]]:
     data = await _openai_post("/v1/embeddings", payload, timeout=60)
     # data['data'] -> list of dicts {embedding: [...], index: i}
     return [item["embedding"] for item in data.get("data", [])]
+
+
+# ===============================================================
+# GPT rerank prompt
+# ===============================================================
 
 
 async def gpt_rerank_prompt(
@@ -105,9 +445,11 @@ async def gpt_rerank_prompt(
     return data["choices"][0]["message"]["content"]
 
 
-# --------------------------
-# Step 1: Scrape HTML -> extract posts + normalize (schema fixed)
-# --------------------------
+# ===============================================================
+# Get HTML Content
+# ===============================================================
+
+
 async def scrape_ebay_html(
     region: Region,
     query: Optional[str] = None,
@@ -170,7 +512,7 @@ async def scrape_ebay_html(
             ),
             "_ipg": "240",
             "_pgn": "1",
-            "_sop": "13",
+            "_sop": "12",
         }
         scraper_logger.info(
             f"📡 Scraping eBay URL: {config['base_url']}?{urlencode(params)}"
@@ -254,9 +596,11 @@ async def scrape_ebay_html(
     return html_pages
 
 
-# --------------------------
-# Extract & Step 1 Normalizer
-# --------------------------
+# ===============================================================
+# Extract Ebay HTML content to data
+# ===============================================================
+
+
 async def extract_ebay_post_data(
     html_pages: List[str], region: str, category_id: Optional[int] = None
 ) -> List[Dict[str, Any]]:
@@ -451,15 +795,18 @@ async def extract_ebay_post_data(
     return unique_posts
 
 
-# --------------------------
-# Step 2: Embedding all post titles using OpenAI (batch)
-# --------------------------
+# ===============================================================
+# Add Embeddings to Posts
+# ===============================================================
+
+
 async def embed_posts(
-    posts: List[Dict[str, Any]], model: str = None, batch_size: int = EMBED_BATCH
+    posts: List[Dict[str, Any]], batch_size: int = EMBED_BATCH
 ) -> None:
     if not posts:
         return
-    model = model or EMBED_MODEL
+
+    model = EMBED_MODEL
     texts = [p["metadata"]["normalized_attributes"]["normalized_title"] for p in posts]
     embeddings: List[List[float]] = []
     # batch
@@ -476,149 +823,229 @@ async def embed_posts(
     for p, emb in zip(posts, embeddings):
         p["embedding"] = emb
 
+    return posts
 
-# --------------------------
+
+# ===============================================================
 # Step 3: NN search (top-k) + optional GPT rerank
-# --------------------------
+# ===============================================================
+
+
 async def select_best_ebay_post(
     posts: List[Dict[str, Any]],
     user_query: str,
     top_k: int = 5,
     rerank_with_gpt: bool = True,
 ) -> Optional[Dict[str, Any]]:
-    """
-    1) embed user_query
-    2) compute cosine similarity with posts' embeddings
-    3) pick top_k candidates
-    4) optionally rerank using GPT (gpt-4o-mini)
-    returns best_post (or None) plus debug info
-    """
+    """Select best eBay post using precise attribute matching + embedding similarity."""
     if not posts:
         return None
 
-    # filter posts that have embeddings
-    candidates = [p for p in posts if p.get("embedding")]
-    if not candidates:
-        # no embeddings available - fallback to simple title match (lowest confidence)
-        # choose first post as fallback
-        return {
-            "found": False,
-            "match": None,
-            "score": 0.0,
-            "reason": "no embeddings",
-            "candidates": [],
-        }
+    scraper_logger.info(f"🎯 Starting selection from {len(posts)} posts...")
 
-    # embed user query
-    try:
-        q_norm = normalize_card_title(user_query)["normalized_title"]
-        q_emb = (await embed_texts([q_norm]))[0]
-    except Exception as e:
-        scraper_logger.error(f"❌ Failed to embed user query: {e}")
-        return {
-            "found": False,
-            "match": None,
-            "score": 0.0,
-            "reason": "embed error",
-            "candidates": [],
-        }
+    # Limit posts to prevent timeout (take first 100 for efficiency)
+    if len(posts) > 100:
+        scraper_logger.info(f"⚡ Limiting to first 100 posts for efficiency")
+        posts = posts[:100]
 
-    # compute similarities
-    scored: List[Tuple[Dict[str, Any], float]] = []
-    for p in candidates:
-        sim = _cosine_sim(q_emb, p["embedding"])
-        scored.append((p, sim))
-    # sort desc by sim
+    # Normalize user query to extract attributes
+    user_attrs = normalize_card_title(user_query)
+    # scraper_logger.info(f"🔍 Extracted user attributes: {user_attrs}")
+
+    # Score posts using attribute matching + embedding similarity
+    scored = []
+    for i, post in enumerate(posts):
+        post_attrs = post.get("metadata", {}).get("normalized_attributes", {})
+
+        # Calculate attribute match score (0-1)
+        attr_score = _calculate_attribute_match_score(user_attrs, post_attrs)
+
+        # Calculate embedding similarity (0-1)
+        embed_score = 0.0
+        if post.get("embedding"):
+            q_norm = user_attrs.get("normalized_title", user_query)
+            q_emb = (await embed_texts([q_norm]))[0]
+            embed_score = _cosine_sim(q_emb, post["embedding"])
+
+        # Combined score: 80% attribute matching + 20% embedding similarity
+        final_score = (attr_score * 0.8) + (embed_score * 0.2)
+
+        scored.append((post, final_score, attr_score, embed_score))
+
+    if not scored:
+        return None
+
+    # Sort by combined score and take top-k
     scored.sort(key=lambda x: x[1], reverse=True)
-    top_candidates = scored[:top_k]
+    top_posts = scored[:top_k]
 
-    # prepare response candidate objects
-    cand_list = []
-    for p, sim in top_candidates:
-        cand_list.append(
-            {
-                "id": p.get("id"),
-                "title": p.get("title"),
-                "sold_price": p.get("sold_price"),
-                "sold_currency": p.get("sold_currency"),
-                "sold_post_url": p.get("sold_post_url"),
-                "similarity": float(sim),
-                "metadata": p.get("metadata", {}),
-            }
+    # Optional GPT reranking for close matches
+    best_post, best_score, best_attr, best_embed = top_posts[0]
+    if rerank_with_gpt and len(top_posts) > 1 and best_score < 0.9:
+        candidates_text = "\n".join(
+            [
+                f"{i+1}. {post['title']} - {post['sold_price']} {post['sold_currency']} (attr:{attr:.2f}, embed:{embed:.2f})"
+                for i, (post, _, attr, embed) in enumerate(top_posts)
+            ]
         )
 
-    # If rerank requested, call GPT to judge best candidate
-    if rerank_with_gpt and len(cand_list) > 0:
-        # build concise prompt
-        lines = [
-            "You are an assistant that decides which eBay sold listing best matches the user's trading-card title.",
-            f'User title: "{user_query}"',
-            "Candidates:",
-        ]
-        for i, c in enumerate(cand_list, start=1):
-            lines.append(
-                f"{i}. Title: {c['title']}\n   Price: {c['sold_price']} {c['sold_currency']}\n   URL: {c['sold_post_url']}\n   Similarity: {c['similarity']:.6f}\n   Attributes: {json.dumps(c['metadata'].get('normalized_attributes', {}))}"
-            )
-        lines.append("")
-        lines.append(
-            "Task: Return a JSON object with keys: selected_index (1-based or null), reason (short), matches (list of {index,score,explanation}). Score must be 0..1."
-        )
-        prompt = "\n".join(lines)
+        prompt = f"""
+        User is looking for: {user_query}
+        
+        Top candidates with scores:
+        {candidates_text}
+        
+        Return the number (1-{len(top_posts)}) of the best match as JSON: {{"choice": N}}
+        """
+
         try:
             gpt_out = await gpt_rerank_prompt(prompt)
-            # try parse JSON
-            try:
-                parsed = json.loads(gpt_out)
-                sel_index = parsed.get("selected_index")
-                if sel_index and 1 <= int(sel_index) <= len(cand_list):
-                    chosen = cand_list[int(sel_index) - 1]
-                    return {
-                        "found": True,
-                        "match": chosen,
-                        "score": (
-                            float(
-                                parsed.get("matches", [])[int(sel_index) - 1].get(
-                                    "score", 0.0
-                                )
-                            )
-                            if parsed.get("matches")
-                            else chosen["similarity"]
-                        ),
-                        "reason": parsed.get("reason"),
-                        "candidates": cand_list,
-                        "gpt_raw": parsed,
-                    }
-            except Exception:
-                # fallback: if GPT returns non-json, choose top similarity
-                scraper_logger.warning(
-                    "⚠️ GPT rerank returned non-JSON, falling back to similarity top-1"
-                )
-        except Exception as e:
-            scraper_logger.warning(f"⚠️ GPT rerank failed: {e}")
+            if isinstance(gpt_out, dict) and "choice" in gpt_out:
+                choice_idx = int(gpt_out["choice"]) - 1
+                if 0 <= choice_idx < len(top_posts):
+                    best_post, best_score, best_attr, best_embed = top_posts[choice_idx]
+        except:
+            scraper_logger.warning(
+                "⚠️ GPT rerank failed, using attribute-based selection"
+            )
 
-    # fallback: choose highest similarity
-    best_post, best_score = top_candidates[0]
-    chosen = {
-        "id": best_post.get("id"),
-        "title": best_post.get("title"),
-        "sold_price": best_post.get("sold_price"),
-        "sold_currency": best_post.get("sold_currency"),
-        "sold_post_url": best_post.get("sold_post_url"),
-        "similarity": float(best_score),
-        "metadata": best_post.get("metadata", {}),
-    }
     return {
         "found": True,
-        "match": chosen,
-        "score": float(best_score),
-        "reason": "similarity_fallback",
-        "candidates": cand_list,
+        "match": {
+            "title": best_post.get("title", ""),
+            "sold_price": best_post.get("sold_price", 0),
+            "sold_currency": best_post.get("sold_currency", "USD"),
+            "sold_post_url": best_post.get("sold_post_url", ""),
+            "sold_at": best_post.get("sold_at", ""),
+            "similarity": best_score,
+            "attribute_score": best_attr,
+            "embedding_score": best_embed,
+            "metadata": best_post.get("metadata", {}),
+        },
+        "debug_info": {
+            "top_k_scores": [
+                (p["title"], score, attr, embed) for p, score, attr, embed in top_posts
+            ],
+            "total_candidates": len(scored),
+            "user_attributes": user_attrs,
+        },
     }
 
 
-# --------------------------
+def _calculate_attribute_match_score(
+    user_attrs: Dict[str, Any], post_attrs: Dict[str, Any]
+) -> float:
+    """Calculate precise attribute match score between user query and post."""
+    score = 0.0
+    total_weight = 0.0
+
+    # Player/Character matching - 50% weight (HIGHEST PRIORITY - must match player)
+    if user_attrs.get("player_or_character") and post_attrs.get("player_or_character"):
+        user_player = user_attrs["player_or_character"].lower()
+        post_player = post_attrs["player_or_character"].lower()
+
+        # Extract key names (ignoring numbers/grades) - minimum 3 characters
+        user_names = [w for w in user_player.split() if w.isalpha() and len(w) >= 3]
+        post_names = [w for w in post_player.split() if w.isalpha() and len(w) >= 3]
+
+        if user_names and post_names:
+            # Require exact name matches (not substring matches)
+            name_matches = sum(1 for name in user_names if name in post_names)
+
+            # Only give score if we have significant name overlap
+            if len(user_names) >= 2:  # Full names (first + last)
+                # Require both first and last name to match for full score
+                if name_matches >= 2:
+                    score += 0.5  # Full player name match
+                elif name_matches == 1:
+                    score += 0.2  # Partial match for one name
+                # No score if no names match
+            else:  # Single name
+                if name_matches > 0:
+                    score += 0.5
+        total_weight += 0.5
+
+    # Set matching - 25% weight
+    if user_attrs.get("set") and post_attrs.get("set"):
+        if user_attrs["set"].lower() == post_attrs["set"].lower():
+            score += 0.25
+        total_weight += 0.25
+    elif user_attrs.get("set"):  # User has set but post doesn't
+        total_weight += 0.25  # Penalty for missing set
+
+    # Year/Date matching - 15% weight
+    user_year = _extract_year(user_attrs.get("normalized_title", ""))
+    post_year = _extract_year(post_attrs.get("normalized_title", ""))
+    if user_year and post_year:
+        if user_year == post_year:
+            score += 0.15
+        elif abs(int(user_year) - int(post_year)) <= 1:  # Allow 1 year difference
+            score += 0.075
+        total_weight += 0.15
+
+    # Serial number/Card number matching - 15% weight
+    user_serial = _extract_serial_number(user_attrs.get("normalized_title", ""))
+    post_serial = _extract_serial_number(post_attrs.get("normalized_title", ""))
+    if user_serial and post_serial:
+        if user_serial.lower() == post_serial.lower():
+            score += 0.15
+        elif user_serial.replace("/", "").replace("#", "") == post_serial.replace(
+            "/", ""
+        ).replace("#", ""):
+            score += 0.1  # Partial match for format differences
+        total_weight += 0.15
+
+    # Return normalized score
+    return score / total_weight if total_weight > 0 else 0.0
+
+
+def _extract_year(text: str) -> Optional[str]:
+    """Extract year from card title, handling season ranges like 2024-25."""
+    import re
+
+    # Look for 4-digit years or year ranges like 2024, 2023/24, 2022-23
+    # Always return the first (main) year from ranges
+    year_match = re.search(r"(20\d{2})(?:[/-]\d{2})?", text)
+    return year_match.group(1) if year_match else None
+
+
+def _extract_serial_number(text: str) -> Optional[str]:
+    """Extract serial number like /25, #123, 048/299, avoiding year ranges like 2024-25."""
+    import re
+
+    # Look for patterns like /25, #123, 048/299, etc.
+    # But avoid year ranges like 2024-25, 2023-24
+    serial_patterns = [
+        r"(?<!20\d{2}[-/])/(\d+)",  # /25 but not after year like 2024-25
+        r"#(\d+)",  # #123
+        r"(\d{3}/\d+)",  # 048/299
+        r"(?<!20\d{2})(\d{1,2}/\d+)",  # 12/50 but not after 4-digit year
+    ]
+
+    for pattern in serial_patterns:
+        match = re.search(pattern, text)
+        if match:
+            captured = match.group(1)
+            # Additional check: if it looks like a year range (specifically XX-YY or XX/YY where XX is a 4-digit year), skip it
+            # But don't skip legitimate serial numbers like /25, #25 etc.
+            year_range_context = re.search(
+                r"(20\d{2})[-/]" + re.escape(captured) + r"\b", text
+            )
+            if year_range_context:
+                continue
+            return captured
+
+    return None
+
+
+# ===============================================================
+
+
+# ===============================================================
 # Step 4: store (supabase) + update user_cards if needed
-# --------------------------
+# ===============================================================
+
+
 async def upsert_ebay_listings(
     posts: List[Dict[str, Any]], user_card_id: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -675,6 +1102,11 @@ async def upsert_ebay_listings(
     return results
 
 
+# ===============================================================
+# Update user card with selected post
+# ===============================================================
+
+
 async def update_user_card(
     selected_post: Dict[str, Any], user_card_id: str
 ) -> Dict[str, Any]:
@@ -697,232 +1129,3 @@ async def update_user_card(
         results["errors"].append(str(e))
         scraper_logger.error(f"❌ Failed update user_cards: {e}")
     return results
-
-
-# --------------------------
-# Main orchestrator
-# --------------------------
-class EbayScraper:
-    def __init__(self):
-        self.region_codes = {"us": "us", "uk": "uk"}
-
-    async def scrape(
-        self,
-        region: Region,
-        query: Optional[str] = None,
-        category_id: Optional[CategoryId] = None,
-        user_card_id: Optional[str] = None,
-        max_pages: int = 50,
-        page_retries: int = 3,
-        disable_proxy: bool = False,
-        rerank_with_gpt: bool = True,
-        top_k: int = 5,
-    ) -> Dict[str, Any]:
-        """
-        Full pipeline:
-        - Step 1: scrape & normalize
-        - Step 2: embed posts
-        - Step 3: nn + optional gpt rerank (if user_card_id provided we pick best)
-        - Step 4: store vectors + upsert posts, update user_card if applied
-        """
-        try:
-            # resolve user_card query early
-            resolved_query = query or "card"
-            if user_card_id:
-                try:
-                    resp = (
-                        supabase.table("user_cards")
-                        .select("custom_name, category_id")
-                        .eq("id", user_card_id)
-                        .limit(1)
-                        .execute()
-                    )
-                    if resp.data:
-                        resolved_query = (
-                            resp.data[0].get("custom_name") or resolved_query
-                        )
-                except Exception as e:
-                    scraper_logger.warning(f"⚠️ Failed to resolve user_card: {e}")
-
-            # Step 1: Scrape html -> extract posts (normalized)
-            html_pages = await scrape_ebay_html(
-                region=region,
-                query=query,
-                category_id=category_id,
-                user_card_id=user_card_id,
-                max_pages=max_pages,
-                page_retries=page_retries,
-                disable_proxy=disable_proxy,
-            )
-            if not html_pages:
-                return {"total": 0, "result": []}
-
-            posts = await extract_ebay_post_data(
-                html_pages=html_pages,
-                region=region.value,
-                category_id=category_id.value if category_id else None,
-            )
-
-            # Step 2: Embedding
-            await embed_posts(posts)
-
-            # Step 3: If user_card_id -> pick best post using NN + optional GPT rerank
-            selected_post_info = None
-            if user_card_id:
-                selected_post_info = await select_best_ebay_post(
-                    posts, resolved_query, top_k=top_k, rerank_with_gpt=rerank_with_gpt
-                )
-
-            # Step 4: Store vectors & posts to supabase
-            upsert_results = await upsert_ebay_listings(
-                posts, user_card_id=user_card_id
-            )
-
-            # If user_card_id and selected found -> update user_card
-            user_update_results = {}
-            if (
-                user_card_id
-                and selected_post_info
-                and selected_post_info.get("found")
-                and selected_post_info.get("match")
-            ):
-                selected = selected_post_info["match"]
-                user_update_results = await update_user_card(selected, user_card_id)
-
-            results = {
-                "total": len(posts),
-                "result": posts,
-                "selected": selected_post_info,
-                "upsert_results": upsert_results,
-                "user_update_results": user_update_results,
-            }
-            scraper_logger.info(
-                f"🎉 Scraping pipeline completed: {len(posts)} posts processed"
-            )
-            return results
-
-        except Exception as e:
-            scraper_logger.error(f"❌ Scraping failed: {e}")
-            raise
-
-
-# Worker manager kept for compatibility (same as before)
-class WorkerStatus(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-@dataclass
-class WorkerTask:
-    id: str
-    query: str
-    region: str
-    category_id: int
-    status: WorkerStatus
-    created_at: datetime
-    user_card_id: Optional[str] = None
-    max_pages: int = 50
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    result_count: int = 0
-    upserted_count: int = 0
-    user_updated: bool = False
-    results: Optional[dict] = None
-    error_message: Optional[str] = None
-
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "query": self.query,
-            "region": self.region,
-            "category_id": self.category_id,
-            "status": self.status.value,
-            "created_at": self.created_at.isoformat(),
-            "user_card_id": self.user_card_id,
-            "max_pages": self.max_pages,
-            "started_at": self.started_at.isoformat() if self.started_at else None,
-            "completed_at": (
-                self.completed_at.isoformat() if self.completed_at else None
-            ),
-            "results_count": self.result_count,
-            "upserted_count": self.upserted_count,
-            "user_updated": self.user_updated,
-            "error_message": self.error_message,
-        }
-
-
-class EbayWorkerManager:
-    def __init__(self):
-        self.active_tasks = {}
-        self.executor = ThreadPoolExecutor(max_workers=3)
-
-    def create_task(
-        self,
-        query: Optional[str] = None,
-        region: Region = Region.us,
-        category_id: Optional[CategoryId] = None,
-        user_card_id: Optional[str] = None,
-        max_pages: int = 50,
-    ) -> WorkerTask:
-        task_id = str(uuid.uuid4())
-        final_query = query or "card"
-        final_category_id = category_id or CategoryId.PANINI
-        task = WorkerTask(
-            id=task_id,
-            query=final_query,
-            region=region.value,
-            category_id=final_category_id.value,
-            status=WorkerStatus.PENDING,
-            created_at=datetime.utcnow(),
-            user_card_id=user_card_id,
-            max_pages=max_pages,
-        )
-        self.active_tasks[task_id] = task
-        return task
-
-    async def _run_scrape_worker(
-        self,
-        task_id: str,
-        region: Region,
-        category_id: CategoryId,
-        query: str,
-        user_card_id: Optional[str],
-        max_pages: int,
-        master_card_id: Optional[str] = None,
-        disable_proxy: bool = False,
-    ):
-        task = self.active_tasks[task_id]
-        try:
-            task.status = WorkerStatus.RUNNING
-            task.started_at = datetime.utcnow()
-            result = await scraper.scrape(
-                region=region,
-                query=query,
-                category_id=category_id,
-                user_card_id=user_card_id,
-                max_pages=max_pages,
-                disable_proxy=disable_proxy,
-            )
-            task.result_count = result.get("total", 0)
-            task.upserted_count = result.get("upsert_results", {}).get(
-                "upserted_count", 0
-            )
-            task.user_updated = bool(
-                result.get("user_update_results", {}).get("user_card_updated", False)
-            )
-            task.results = result
-            task.status = WorkerStatus.COMPLETED
-            task.completed_at = datetime.utcnow()
-            scraper_logger.info(f"✅ Task {task_id} completed")
-        except Exception as e:
-            task.status = WorkerStatus.FAILED
-            task.error_message = str(e)
-            task.completed_at = datetime.utcnow()
-            scraper_logger.error(f"❌ Task {task_id} failed: {e}")
-
-
-# init
-scraper = EbayScraper()
-worker_manager = EbayWorkerManager()
