@@ -1,298 +1,518 @@
-# matching_new.py
+# matcher_updated.py
 import os
 import re
 import unicodedata
+import json
 import asyncio
 from datetime import datetime
-from typing import Dict, List, Optional, Any
-import json
+from typing import List, Dict, Any, Optional
+
+# optional OpenAI usage (gpt selector / embeddings) - only used if key present
+try:
+    import openai
+except Exception:
+    openai = None
 
 import numpy as np
 
-from src.utils.logger import get_logger
-
-matching_logger = get_logger("matching", level="DEBUG")
-
-
-def normalize_title(title: str) -> Dict[str, Any]:
+# ---------------------------
+# Improved cleaner & extractor
+# ---------------------------
+def clean_text_for_tokens(s: str) -> str:
     """
-    Normalize a raw eBay title and extract structured fields.
-    Returns dict with keys:
-      raw, normalized, year, brand, setName, subset, player_name,
-      serial_numbered, card_number, grading, variant, confidence
+    Normalize unicode, remove emoji, keep / # - . : because they are meaningful
+    for card numbers and serials. Collapse whitespace.
     """
-    if not title:
-        return {
-            "raw": title,
-            "normalized": "",
-            "year": None,
-            "brand": None,
-            "setName": None,
-            "subset": None,
-            "player_name": None,
-            "serial_numbered": None,
-            "card_number": None,
-            "grading": None,
-            "variant": None,
-            "confidence": 0.0,
-        }
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    # remove emoji / non-BMP
+    s = re.sub(r"[\U00010000-\U0010ffff]", " ", s)
+    # remove quotes and some punctuation but keep slash, hash, dash, dot, colon
+    s = re.sub(r"[,_·•\(\)\[\]:;\"`']", " ", s)
+    # remove other weird chars but preserve / # - . :
+    s = re.sub(r"[^\w\s\/#\-\.\:]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-    raw = title
-    s = unicodedata.normalize("NFKC", raw)
-    s = re.sub(r"[\U00010000-\U0010ffff]", " ", s)  # remove emoji / non-BMP
-    s = s.strip()
-    orig = s[:]
-    s_lower = s.lower()
+def extract_numbers_and_serials(text: str) -> Dict[str, Optional[str]]:
+    """
+    Robust extractor:
+      - card_number: '238/191' or '12/25' (numerator/denominator)
+      - serial_full: e.g. 'SV08/25' or 'SVO8/25' (code + run)
+      - serial_code: e.g. 'SV08', 'CR7' (code without run)
+      - serial_run: denominator-only like '25' if found as '/25' token
+    It returns last/most-likely occurrences (prefer trailing tokens).
+    """
+    out = {"card_number": None, "serial_full": None, "serial_code": None, "serial_run": None}
+    if not text:
+        return out
+    s = text
 
-    # remove irrelevant punctuation but keep #, /, -
-    s_lower = re.sub(r"[,_·•\(\)\[\]:;\"`']", " ", s_lower)
-    s_lower = re.sub(r"\s+", " ", s_lower).strip()
+    # 1) Find tokens like "#12/25" or "12/25" or "SV08/25"
+    for m in re.finditer(r"(?<!\S)(#?\s*[A-Za-z0-9\-]{1,10})\s*/\s*(\d{1,4})(?!\S)", s):
+        left_raw = m.group(1).replace(" ", "")
+        denom = m.group(2)
+        left = left_raw.lstrip("#")
+        # if left is pure digits => card number numerator/denominator
+        if re.fullmatch(r"\d{1,4}", left):
+            out["card_number"] = f"{left}/{denom}"
+        else:
+            # left contains letters or letters+digits -> treat as serial_full OR serial_code+run
+            out["serial_full"] = f"{left}/{denom}"
+            code_match = re.match(r"([A-Za-z0-9\-]+)", left)
+            if code_match:
+                out["serial_code"] = code_match.group(1).upper()
+            out["serial_run"] = denom
+        # continue looping to keep last occurrence (prefer trailing)
 
-    # grading
-    grading = None
-    gm = re.search(r"\b(psa|bgs|sgc|hga|cas)\s*([0-9](?:\.[05])?)\b", s_lower, flags=re.IGNORECASE)
-    if gm:
-        grading = f"{gm.group(1).upper()} {gm.group(2)}"
-        s_lower = s_lower[:gm.start()] + s_lower[gm.end():]
-        s_lower = s_lower.strip()
+    # 2) Denominator-only like '/25' (standalone)
+    if not out["card_number"] and not out["serial_full"]:
+        m_denom = re.search(r"(?<!\S)/\s*(\d{1,4})(?!\S)", s)
+        if m_denom:
+            out["serial_run"] = m_denom.group(1)
 
-    # explicit # token
-    explicit_hash = None
-    hm = re.search(r"#\s*([a-z0-9\-\/]+)", s_lower, flags=re.IGNORECASE)
-    if hm:
-        explicit_hash = hm.group(1).strip()
-        s_lower = s_lower[:hm.start()] + s_lower[hm.end():]
-        s_lower = s_lower.strip()
-
-    # fractions (a/b)
-    fracs = [(m.group(0), m.start(), m.end(), m.group(1), m.group(2))
-             for m in re.finditer(r"\b(\d{1,4})\s*/\s*(\d{1,4})\b", s_lower)]
-
-    # year (YYYY) or season-derived
-    year = None
-    ym = re.search(r"\b(19|20)\d{2}\b", s_lower)
-    if ym:
-        year = ym.group(0)
-        s_lower = s_lower[:ym.start()] + s_lower[ym.end():]
-        s_lower = s_lower.strip()
-    else:
-        chosen = None
-        for i, (f, start, end, a, b) in enumerate(fracs):
-            if len(a) == 4:
-                chosen = i
-                break
-        if chosen is None:
-            for i, (f, start, end, a, b) in enumerate(fracs):
-                left = s_lower[max(0, start - 20):start]
-                if re.search(r"( set| season| series| collection| pack| fan| ucl| champions| match )", left):
-                    chosen = i
+    # 3) Orphan serial codes (trailing tokens like 'SV08' or 'CR7')
+    if not out["serial_code"]:
+        tokens = re.findall(r"[A-Za-z0-9\-]{2,12}", s)
+        for t in reversed(tokens):
+            if re.fullmatch(r"\d{1,4}", t):
+                continue
+            if re.search(r"[A-Za-z]", t) and re.search(r"\d", t):
+                if len(t) >= 3:
+                    out["serial_code"] = t.upper()
                     break
-        if chosen is not None:
-            _, start, end, a, b = fracs[chosen]
-            if len(a) == 2:
-                year = "20" + a
-            else:
-                year = a
-            s_lower = s_lower[:start] + s_lower[end:]
-            s_lower = s_lower.strip()
-            fracs.pop(chosen)
 
-    # card_number (from fraction) prefer remaining fractions
-    card_number = None
-    if fracs:
-        for (f, start, end, a, b) in fracs:
-            card_number = f"{a}/{b}"
-            s_lower = s_lower[:start] + s_lower[end:]
-            s_lower = s_lower.strip()
-            break
+    # 4) If card_number still not found, try pattern with leading '#'
+    if not out["card_number"]:
+        m = re.search(r"#\s*(\d{1,4})\s*/\s*(\d{1,4})", s)
+        if m:
+            out["card_number"] = f"{m.group(1)}/{m.group(2)}"
 
-    # prefer explicit_hash with slash as card number
-    if explicit_hash and "/" in explicit_hash and re.search(r"\d", explicit_hash):
-        card_number = explicit_hash.replace(" ", "")
-        explicit_hash = None
+    # cleanup formats
+    if out["card_number"]:
+        out["card_number"] = out["card_number"].replace(" ", "")
+    if out["serial_full"]:
+        out["serial_full"] = out["serial_full"].replace(" ", "")
+        if not out["serial_code"]:
+            left = out["serial_full"].split("/")[0]
+            out["serial_code"] = left.upper()
+    if out["serial_run"]:
+        out["serial_run"] = out["serial_run"].strip()
 
-    # detect serial code (letters+digits, e.g., SVO8, BA-CR1, CR7)
-    serial_code = None
-    tokens_orig = re.findall(r"[A-Za-z0-9\-\/]+", orig)
-    tokens_lower = [t.lower() for t in tokens_orig]
-    for t in reversed(tokens_orig):
-        tl = t.strip()
-        if "/" in tl or "#" in tl:
+    return out
+
+# ---------------------------
+# Set/name detection
+# ---------------------------
+def detect_set_and_name(tokens: List[str], brand: Optional[str], year_token: Optional[str],
+                        card_number_token: Optional[str], serial_token: Optional[str]) -> (Optional[str], Optional[str]):
+    cleaned = []
+    excludes = set()
+    if year_token:
+        excludes.add(year_token)
+    if card_number_token:
+        excludes.add(card_number_token)
+        excludes.add("#" + card_number_token)
+    if serial_token:
+        excludes.add(serial_token)
+    if brand:
+        excludes.add(brand.lower()); excludes.add(brand)
+    for t in tokens:
+        if not t:
             continue
-        if re.fullmatch(r"\d{1,4}", tl):
+        if t.lower() in excludes:
             continue
-        # pattern: letters + digits (optionally hyphen)
-        if re.search(r"[A-Za-z]{1,4}\-?[A-Za-z0-9]{1,6}\d", tl):
-            if re.search(r"[A-Za-z]", tl) and re.search(r"\d", tl):
-                serial_code = tl.upper()
-                # remove first occurrence in s_lower
-                try:
-                    s_lower = re.sub(re.escape(tl.lower()), " ", s_lower, count=1)
-                    s_lower = re.sub(r"\s+", " ", s_lower).strip()
-                except Exception:
-                    pass
-                break
-
-    # explicit_hash that is alnum+digit but not slash -> serial
-    if not serial_code and explicit_hash and re.search(r"[A-Za-z]", explicit_hash) and re.search(r"\d", explicit_hash) and "/" not in explicit_hash:
-        serial_code = explicit_hash.upper()
-        explicit_hash = None
-
-    # if explicit_hash still digits -> treat as simple card_number (collector)
-    if explicit_hash and re.search(r"\d", explicit_hash) and not card_number:
-        card_number = explicit_hash.upper()
-        explicit_hash = None
-
-    # cleanup
-    s_lower = re.sub(r"[^\w\s\-\/]", " ", s_lower)
-    s_lower = re.sub(r"\s+", " ", s_lower).strip()
-    tokens = s_lower.split()
-
-    # strip noise at end
-    noise_end = {"e", "en", "eng", "ebay", "lot", "cards", "card", "for", "from"}
-    while tokens and tokens[-1] in noise_end:
-        tokens.pop()
-
-    # brand heuristic (first token)
-    brand = None
-    noise_start = {"the", "authentic", "official", "new", "rare", "lot"}
-    if tokens and tokens[0] not in noise_start:
-        brand = tokens.pop(0).capitalize()
-
-    # set detection
-    setName = None
-    subset = None
+        cleaned.append(t)
+    set_keywords = {"set", "series", "collection", "pack", "edition", "evolution", "prismatic", "classic", "foil", "holo", "premium", "deco", "topps", "chrome"}
     idx_set = None
-    for i, t in enumerate(tokens):
-        if t in ("set", "series", "collection", "pack", "fan", "edition",
-                 "evolution", "prismatic", "premier", "classic"):
+    for i, t in enumerate(cleaned):
+        if t.lower() in set_keywords:
             idx_set = i
             break
-
+    set_name = None; name = None
     if idx_set is not None:
-        left_start = max(0, idx_set - 3)
-        set_tokens = tokens[left_start:idx_set + 1]
+        left = cleaned[max(0, idx_set - 3): idx_set + 1]
         right = []
         j = idx_set + 1
-        while j < len(tokens) and len(right) < 4 and not re.match(r"\d{1,4}$", tokens[j]):
-            right.append(tokens[j])
-            j += 1
-        if set_tokens:
-            setName = " ".join(set_tokens)
-        if right:
-            subset = " ".join(right)
-        tokens = tokens[:left_start] + tokens[j:]
+        while j < len(cleaned) and len(right) < 4:
+            if re.fullmatch(r"\d{1,4}", cleaned[j]):
+                break
+            right.append(cleaned[j]); j += 1
+        set_name = " ".join(left + right).strip()
+        if j < len(cleaned):
+            name_tokens = cleaned[j:j+3]
+            if name_tokens:
+                name = " ".join(name_tokens).strip()
     else:
-        if tokens:
-            take = min(3, len(tokens))
-            setName = " ".join(tokens[:take])
-            tokens = tokens[take:]
+        if len(cleaned) >= 4:
+            set_name = " ".join(cleaned[:3])
+            name = " ".join(cleaned[3:6])
+        elif len(cleaned) >= 2:
+            name = " ".join(cleaned[-2:])
+            set_name = " ".join(cleaned[:-2]) if len(cleaned) > 2 else None
+        elif len(cleaned) == 1:
+            name = cleaned[0]; set_name = None
+    if name:
+        name = " ".join([w.capitalize() for w in re.findall(r"[A-Za-z0-9]+", name)])
+    if set_name:
+        set_name = " ".join([w.capitalize() for w in re.findall(r"[A-Za-z0-9]+", set_name)])
+    return set_name or None, name or None
 
-    # avoid set duplicating brand
-    if setName and brand and setName.lower().startswith(brand.lower()):
-        parts = setName.split()
-        if len(parts) > 1:
-            setName = " ".join(parts[1:])
-        else:
-            setName = None
+# ---------------------------
+# Build normalized canonical + metadata
+# ---------------------------
+def build_normalized_and_metadata(title: str) -> Dict[str, Any]:
+    t = title or ""
+    cleaned = clean_text_for_tokens(t)
+    nums = extract_numbers_and_serials(t)  # use raw title for best symbol capture
 
-    # player/card name extraction
-    player_name = None
-    extras = []
-    if tokens:
-        alpha_tokens = [t for t in tokens if not re.search(r"\d", t)]
-        if alpha_tokens:
-            take = min(len(alpha_tokens), 3)
-            name_tokens = []
-            removed = 0
-            for t in tokens:
-                if not re.search(r"\d", t) and len(name_tokens) < take:
-                    name_tokens.append(t)
-                    removed += 1
-                else:
-                    break
-            player_name = " ".join([w.capitalize() for w in name_tokens])
-            tokens = tokens[removed:]
-        extras.extend(tokens)
+    # year detection from cleaned text
+    year = None
+    ym = re.search(r"\b(19|20)\d{2}\b", cleaned)
+    if ym:
+        year = ym.group(0)
 
-    # include serial and grading in extras
-    if serial_code and serial_code not in extras:
-        extras.insert(0, serial_code)
-    if grading:
-        extras.append(grading)
+    # tokens keep slashes/hashes/dots preserved
+    tokens = re.findall(r"[A-Za-z0-9\/#\-\.\:]{1,20}", cleaned)
 
-    # build canonical normalized string
+    # brand detection (first alpha token not in noise)
+    brand = None
+    noise_start = {"the", "authentic", "official", "new", "rare", "lot", "sealed"}
+    for tok in tokens:
+        tl = tok.lower()
+        if tl in noise_start:
+            continue
+        if re.search(r"[A-Za-z]", tok):
+            brand = tok.capitalize()
+            break
+
+    set_name, name = detect_set_and_name(tokens, brand, year, nums.get("card_number"), nums.get("serial_code"))
+
+    # fallback name if missing
+    if not name:
+        excludes = set()
+        if brand:
+            excludes.add(brand.lower()); excludes.add(brand)
+        if year:
+            excludes.add(year)
+        if nums.get("card_number"):
+            excludes.add(nums["card_number"])
+        if nums.get("serial_full"):
+            excludes.add(nums["serial_full"])
+        if nums.get("serial_run"):
+            excludes.add("/" + nums["serial_run"])
+        remaining = [tk for tk in tokens if tk and tk not in excludes and re.search(r"[A-Za-z]", tk)]
+        if remaining:
+            name = " ".join([w.capitalize() for w in remaining[-2:]])
+
+    # compose canonical normalized string: Year Brand Set Name Serial CardNumber SerialRun (if no cardnum)
     parts = []
-    if year:
-        parts.append(str(year))
-    if brand:
-        parts.append(brand)
-    if setName:
-        set_name_clean = " ".join([w.capitalize() if w.isalpha() else w for w in setName.split()])
-        parts.append(set_name_clean)
-    if player_name:
-        parts.append(player_name)
+    if year: parts.append(str(year))
+    if brand: parts.append(brand)
+    if set_name: parts.append(set_name)
+    if name: parts.append(name)
+    serial_code = nums.get("serial_code")
     if serial_code:
         parts.append(serial_code.upper())
+    card_number = nums.get("card_number")
     if card_number:
-        parts.append("#" + str(card_number).upper())
-    if extras:
-        ex_formatted = []
-        for e in extras:
-            if re.search(r"[A-Za-z]", e) and re.search(r"\d", e):
-                ex_formatted.append(e.upper())
-            else:
-                ex_formatted.append(e.capitalize())
-        parts.append(" ".join(ex_formatted))
+        parts.append(card_number)
+    elif nums.get("serial_run") and not serial_code:
+        parts.append("/" + nums.get("serial_run"))
 
     normalized = " ".join(parts).strip()
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    normalized = re.sub(r"\b(\w+)(?:\s+\1\b)+", r"\1", normalized, flags=re.IGNORECASE)
 
-    # confidence scoring (simple heuristic)
-    score = 0.0
-    weight = 0.0
-    weight += 1; score += 1.0 if year else 0.0
-    weight += 1; score += 1.0 if brand else 0.0
-    weight += 1; score += 1.0 if setName else 0.0
-    weight += 1
-    if card_number:
-        score += 1.0
-    elif serial_code:
-        score += 0.6
-    else:
-        score += 0.0
-    weight += 1; score += 1.0 if player_name else 0.5 if extras else 0.0
-    confidence = round((score / weight) if weight > 0 else 0.0, 3)
-
-    serial_numbered = serial_code.upper() if serial_code else None
-    card_number_formatted = card_number if card_number else None
-
-    matching_logger.debug(
-        f'Ebay Post: "{raw}"\n'
-        f'Normalized: "{normalized}" | year={year} brand={brand} set={setName} subset={subset} '
-        f'player={player_name} serial_numbered={serial_numbered} card_number={card_number_formatted} grading={grading} confidence={confidence}'
-    )
-
-    return {
-        "raw": raw,
-        "normalized": normalized,
-        "year": year,
-        "brand": brand,
-        "setName": setName,
-        "subset": subset,
-        "player_name": player_name,
-        "serial_numbered": serial_numbered,
-        "card_number": card_number_formatted,   # e.g. "238/191"
-        "grading": grading,
-        "variant": " ".join(extras) if extras else None,
-        "confidence": confidence
+    metadata = {
+        "Year": str(year) if year else None,
+        "Brand": brand if brand else None,
+        "Set": set_name if set_name else None,
+        "Name": name if name else None,
+        "Serial Numbered": serial_code.upper() if serial_code else None,
+        "Card Number": card_number if card_number else None,
+        "Serial Run": nums.get("serial_run") if nums.get("serial_run") else None,
+        "Serial Full": nums.get("serial_full") if nums.get("serial_full") else None,
     }
+    return {"raw": title, "normalized": normalized, "metadata": metadata}
 
+# ---------------------------
+# Compare metadata scoring (weights include serial run/full)
+# ---------------------------
+def compare_metadata_score(user_meta: Dict[str, Any], post_meta: Dict[str, Any]) -> float:
+    """
+    Returns raw score (not normalized). We define weights for:
+      - card number exact
+      - serial full exact
+      - serial run denominator match
+      - serial code match
+      - name exact / partial
+      - set match
+      - year & brand
+    """
+    # weights (tunable)
+    W_CARD = 5.0            # exact numerator/denominator card number
+    W_SERIAL_FULL = 4.5    # serial code + /run exact
+    W_SERIAL_RUN = 3.5     # denominator-only match (/25)
+    W_SERIAL_CODE = 3.0    # serial code only (SV08)
+    W_NAME_EXACT = 2.0
+    W_NAME_PART = 1.0
+    W_SET = 1.0
+    W_YEAR = 0.6
+    W_BRAND = 0.4
 
-# ------------------------------
-# Matching function: single pipeline
-# ------------------------------
+    def norm(x): return "" if not x else re.sub(r"\s+", " ", re.sub(r"[^\w\/#\-\:]"," ", str(x))).strip().lower()
+
+    u_card = norm(user_meta.get("Card Number"))
+    u_serial_full = norm(user_meta.get("Serial Full"))
+    u_serial_code = norm(user_meta.get("Serial Numbered"))
+    u_serial_run = norm(user_meta.get("Serial Run"))
+    u_name = norm(user_meta.get("Name"))
+    u_set = norm(user_meta.get("Set"))
+    u_year = norm(user_meta.get("Year"))
+    u_brand = norm(user_meta.get("Brand"))
+
+    p_card = norm(post_meta.get("Card Number"))
+    p_serial_full = norm(post_meta.get("Serial Full"))
+    p_serial_code = norm(post_meta.get("Serial Numbered"))
+    p_serial_run = norm(post_meta.get("Serial Run"))
+    p_name = norm(post_meta.get("Name"))
+    p_set = norm(post_meta.get("Set"))
+    p_year = norm(post_meta.get("Year"))
+    p_brand = norm(post_meta.get("Brand"))
+
+    score = 0.0
+
+    # exact card number
+    if u_card and p_card and u_card.replace("#","") == p_card.replace("#",""):
+        score += W_CARD
+
+    # serial full exact (code/run)
+    if u_serial_full and p_serial_full and (u_serial_full == p_serial_full):
+        score += W_SERIAL_FULL
+
+    # serial code exact
+    if u_serial_code and p_serial_code and u_serial_code == p_serial_code:
+        score += W_SERIAL_CODE
+
+    # serial run denominator match (e.g., user has /25 and post has /25 in either card_number or serial_run)
+    if u_serial_run:
+        # compare denominators
+        if p_serial_run and u_serial_run == p_serial_run:
+            score += W_SERIAL_RUN
+        else:
+            # maybe post card_number endswith same denom
+            if p_card and "/" in p_card:
+                denom = p_card.split("/")[-1]
+                if denom == u_serial_run:
+                    score += W_SERIAL_RUN * 0.9  # slightly lower than exact serial_run field
+    # Name exact / partial
+    if u_name and p_name and u_name == p_name:
+        score += W_NAME_EXACT
+    else:
+        if u_name and p_name:
+            utoks = set(u_name.split()); ptoks = set(p_name.split())
+            if utoks and ptoks:
+                overlap = len(utoks & ptoks); denom = max(len(utoks), len(ptoks))
+                score += W_NAME_PART * (overlap / denom)
+    # Set matching (exact or partial)
+    if u_set and p_set:
+        if u_set == p_set:
+            score += W_SET
+        else:
+            us = set(u_set.split()); ps = set(p_set.split())
+            if us & ps:
+                score += W_SET * (len(us & ps) / max(1, len(us)))
+
+    # year & brand
+    if u_year and p_year and u_year == p_year:
+        score += W_YEAR
+    if u_brand and p_brand and u_brand == p_brand:
+        score += W_BRAND
+
+    return score
+
+# ---------------------------
+# Optional: GPT selector (compact metadata) - synchronous wrapper
+# ---------------------------
+def call_gpt_selector_sync(user_meta: Dict[str, Any], compact_candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Calls gpt-4o-mini to select best candidate.
+    Returns dict: {"chosen_index": int|null, "confidence": float, "reason": str} or None if not available.
+    """
+    openai_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY")
+    if openai is None or not openai_key:
+        return None
+
+    try:
+        openai.api_key = openai_key
+        candidates_json = json.dumps(compact_candidates, ensure_ascii=False, separators=(",", ":"))
+        user_json = json.dumps(user_meta, ensure_ascii=False, separators=(",", ":"))
+
+        system_msg = (
+            "You are a precise assistant. Given a user's card metadata and a short list of candidate postings (each with metadata), "
+            "select the single BEST MATCH. Prioritize keys in this order: Card Number (exact), Serial Full (code/run), "
+            "Serial Run (denominator), Serial Code, Name, Set, Year, Brand. Return JSON ONLY: "
+            "{\"chosen_index\": <int|null>, \"confidence\": <0.0-1.0>, \"reason\": \"short explanation\"}."
+        )
+        user_msg = (
+            f"User metadata: {user_json}\n\n"
+            f"Candidates (index,title,metadata): {candidates_json}\n\n"
+            "Return JSON only. If no candidate matches sufficiently, return chosen_index:null and confidence:0.0."
+        )
+
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg}
+            ],
+            temperature=0.0,
+            max_tokens=200,
+        )
+        text = ""
+        try:
+            text = resp["choices"][0]["message"]["content"]
+        except Exception:
+            text = str(resp)
+
+        text_str = str(text).strip()
+        try:
+            parsed = json.loads(text_str)
+            return parsed
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", text_str)
+            if m:
+                try:
+                    return json.loads(m.group(0))
+                except Exception:
+                    return None
+            return None
+    except Exception:
+        return None
+
+# ---------------------------
+# match_user_card fallback deterministic (sync)
+# ---------------------------
+def match_user_card(user_card_title: str, ebay_posts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Synchronous deterministic comparator:
+     - normalizes all posts and user
+     - tries direct exact matches: card_number, serial_full, serial_run (denominator)
+     - otherwise scores per compare_metadata_score and picks best (tie-break by sold_at)
+     - returns matched original post dict or None
+    """
+    # prepare posts normalized
+    posts = []
+    for p in ebay_posts or []:
+        post = dict(p)
+        raw_title = post.get("name") or post.get("title") or ""
+        nm = build_normalized_and_metadata(raw_title)
+        post["_normalized"] = nm["normalized"]
+        post["_metadata"] = nm["metadata"]
+        sold = post.get("sold_at")
+        post["_sold_at_parsed"] = None
+        if sold:
+            try:
+                post["_sold_at_parsed"] = datetime.fromisoformat(str(sold).replace("Z", "+00:00"))
+            except Exception:
+                try:
+                    post["_sold_at_parsed"] = datetime.strptime(str(sold), "%Y-%m-%d")
+                except Exception:
+                    post["_sold_at_parsed"] = None
+        posts.append(post)
+
+    user_norm = build_normalized_and_metadata(user_card_title)
+    user_meta = user_norm["metadata"]
+
+    # require at least some metadata
+    if not any(user_meta.values()):
+        return None
+
+    # 1) direct deterministic checks
+    u_card = (user_meta.get("Card Number") or "").strip()
+    u_serial_full = (user_meta.get("Serial Full") or "").strip()
+    u_serial_run = (user_meta.get("Serial Run") or "").strip()
+    u_serial_code = (user_meta.get("Serial Numbered") or "").strip()
+
+    # if exact card_number in user -> return exact match if exists
+    if u_card:
+        for p in posts:
+            p_card = (p.get("_metadata") or {}).get("Card Number")
+            if p_card and p_card.replace(" ", "") == u_card.replace(" ", ""):
+                return p
+
+    # if full serial present -> exact match
+    if u_serial_full:
+        for p in posts:
+            if (p.get("_metadata") or {}).get("Serial Full") == u_serial_full:
+                return p
+
+    # if serial_run present (denominator only) -> filter posts with matching denom either in Card Number or Serial Run
+    if u_serial_run:
+        candidates = []
+        for p in posts:
+            pm = (p.get("_metadata") or {})
+            p_serial_run = pm.get("Serial Run")
+            p_card = pm.get("Card Number")
+            if p_serial_run and p_serial_run == u_serial_run:
+                candidates.append(p)
+            elif p_card and "/" in p_card and p_card.split("/")[-1] == u_serial_run:
+                candidates.append(p)
+        if len(candidates) == 1:
+            return candidates[0]
+        elif len(candidates) > 1:
+            # score among candidates
+            best = None; best_score = -1
+            for c in candidates:
+                s = compare_metadata_score(user_meta, c.get("_metadata") or {})
+                if s > best_score:
+                    best_score = s; best = c
+                elif s == best_score:
+                    # tie-break by sold_at (most recent)
+                    d_best = best.get("_sold_at_parsed")
+                    d_c = c.get("_sold_at_parsed")
+                    if d_c and (not d_best or d_c > d_best):
+                        best = c
+            # require reasonable score
+            if best and best_score > 0:
+                return best
+
+    # 2) fallback scoring across all posts
+    scored = []
+    for p in posts:
+        s = compare_metadata_score(user_meta, p.get("_metadata") or {})
+        scored.append({"post": p, "score": s})
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    if not scored:
+        return None
+
+    top = scored[0]
+    # compute SUM_POSSIBLE to normalize
+    SUM_POSSIBLE = 5.0 + 4.5 + 3.5 + 3.0 + 2.0 + 1.0 + 0.6 + 0.4
+    threshold_raw = 0.55 * SUM_POSSIBLE  # require >55% of max or card/serial exact
+    if top["score"] >= threshold_raw:
+        # if multiple similarly high, choose most recent sold_at
+        close = [c for c in scored if (top["score"] - c["score"]) <= 0.03 * SUM_POSSIBLE]
+        if len(close) > 1:
+            best = None; bestd = None
+            for c in close:
+                d = c["post"].get("_sold_at_parsed")
+                if d and (bestd is None or d > bestd):
+                    best = c["post"]; bestd = d
+            return best or close[0]["post"]
+        return top["post"]
+    # if not meet threshold but top has exact card or serial, accept
+    pmeta = top["post"].get("_metadata") or {}
+    if u_card and pmeta.get("Card Number") and u_card.replace(" ", "") == pmeta.get("Card Number").replace(" ", ""):
+        return top["post"]
+    if u_serial_full and pmeta.get("Serial Full") and u_serial_full == pmeta.get("Serial Full"):
+        return top["post"]
+    # else no match
+    return None
+
+# ---------------------------
+# get_last_sold_item (async main function required)
+# ---------------------------
 async def get_last_sold_item(
     user_card_title: str,
     normalized_posts: List[Dict[str, Any]],
@@ -302,418 +522,195 @@ async def get_last_sold_item(
     required_confidence: float = 0.97,
 ) -> Dict[str, Any]:
     """
-    Inputs:
-      - user_card_title: string
-      - normalized_posts: list of dicts (each should contain at least 'id','title'/'name','sold_at')
-        optionally may already contain 'normalized' field (dict from normalize_title)
-    Returns:
-      dict with keys: found(bool), match(dict|None), score(float), reason(str), candidates(list)
+    Async wrapper compatible with prior signature.
+    Returns dict: {found(bool), match(post|None), score(float 0..1), reason(str), candidates(list)}
     """
+    # limit posts
+    posts = list(normalized_posts or [])[:top_k]
 
-    # helper: parse sold_at robustly
-    def parse_date(d: Optional[Any]) -> Optional[datetime]:
-        if not d:
-            return None
-        if isinstance(d, datetime):
-            return d
-        s = str(d).strip()
-        # try iso
-        try:
-            return datetime.fromisoformat(s.replace("Z", "+00:00"))
-        except Exception:
-            pass
-        fmts = ["%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%b %d %Y", "%d %b %Y"]
-        for f in fmts:
+    # ensure posts normalized
+    posts_prepared = []
+    for p in posts:
+        post = dict(p)
+        raw_title = post.get("name") or post.get("title") or ""
+        if not post.get("_metadata") or not post.get("_normalized"):
+            nm = build_normalized_and_metadata(raw_title)
+            post["_normalized"] = nm["normalized"]
+            post["_metadata"] = nm["metadata"]
+        sold = post.get("sold_at")
+        post["_sold_at_parsed"] = None
+        if sold:
             try:
-                return datetime.strptime(s, f)
+                post["_sold_at_parsed"] = datetime.fromisoformat(str(sold).replace("Z", "+00:00"))
             except Exception:
-                continue
-        m = re.search(r"(20\d{2}|19\d{2})", s)
-        if m:
-            try:
-                return datetime(int(m.group(0)), 1, 1)
-            except Exception:
-                return None
-        return None
+                try:
+                    post["_sold_at_parsed"] = datetime.strptime(str(sold), "%Y-%m-%d")
+                except Exception:
+                    post["_sold_at_parsed"] = None
+        posts_prepared.append(post)
 
-    # helper: cosine similarity
-    def cosine(a: np.ndarray, b: np.ndarray) -> float:
-        if a is None or b is None:
-            return 0.0
-        na = np.linalg.norm(a)
-        nb = np.linalg.norm(b)
-        if na == 0.0 or nb == 0.0:
-            return 0.0
-        return float(np.dot(a, b) / (na * nb))
+    # normalize user
+    user_nm = build_normalized_and_metadata(user_card_title)
+    user_meta = user_nm["metadata"]
 
-    # helper: extract price from post dict robustly
-    def extract_price(post: Dict[str, Any]) -> Optional[float]:
-        if not post:
-            return None
-        for key in ("price", "sold_price", "sale_price", "final_price", "amount", "soldAmount"):
-            if key in post and post[key] is not None:
-                v = post[key]
-                # if dict with value/amount
-                if isinstance(v, dict):
-                    for subk in ("value", "amount", "price"):
-                        if subk in v and v[subk] is not None:
-                            try:
-                                return float(v[subk])
-                            except Exception:
-                                continue
-                else:
-                    try:
-                        return float(v)
-                    except Exception:
-                        # maybe string with currency symbol
-                        s = str(v)
-                        m = re.search(r"[\d\.,]+", s)
-                        if m:
-                            try:
-                                # normalize thousand/comma
-                                val = m.group(0).replace(",", "")
-                                return float(val)
-                            except Exception:
-                                continue
-        # try nested 'metadata' or 'sale' keys
-        if "metadata" in post and isinstance(post["metadata"], dict):
-            return extract_price(post["metadata"])
-        if "sale" in post and isinstance(post["sale"], dict):
-            return extract_price(post["sale"])
-        return None
+    # if user metadata empty -> cannot match
+    if not any(user_meta.values()):
+        return {"found": False, "match": None, "score": 0.0, "reason": "insufficient_user_metadata", "candidates": []}
 
-    # LLM selector: ask gpt-4o-mini to pick best candidate (returns dict)
-    async def call_gpt_selector(user_norm: Dict[str, Any], shortlist: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        openai_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY")
-        if not openai_key:
-            return None
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=openai_key)
-
-            # build prompt
-            user_summary = {
-                "normalized": user_norm.get("normalized"),
-                "year": user_norm.get("year"),
-                "brand": user_norm.get("brand"),
-                "player_name": user_norm.get("player_name"),
-                "card_number": user_norm.get("card_number"),
-                "serial_numbered": user_norm.get("serial_numbered"),
+    # Try deterministic fast-path (no LLM) via match_user_card
+    try:
+        maybe = match_user_card(user_card_title, posts_prepared)
+        if asyncio.iscoroutine(maybe):
+            maybe = await maybe
+        if maybe:
+            # compute score
+            final_score_raw = compare_metadata_score(user_meta, (maybe.get("_metadata") or {}))
+            SUM_POSSIBLE = 5.0 + 4.5 + 3.5 + 3.0 + 2.0 + 1.0 + 0.6 + 0.4
+            normalized_final = float(max(0.0, min(1.0, final_score_raw / SUM_POSSIBLE)))
+            # Deterministic match found - should always be True regardless of confidence
+            return {
+                "found": True,
+                "match": maybe,
+                "score": round(normalized_final, 4),
+                "reason": "deterministic_match",
+                "candidates": []
             }
-
-            candidate_lines = []
-            for idx, c in enumerate(shortlist):
-                p = c["post"]
-                price = extract_price(p)
-                candidate_lines.append({
-                    "index": idx,
-                    "title": p.get("title") or p.get("name"),
-                    "normalized": (p.get("_norm") or {}).get("normalized") or (p.get("_canonical")),
-                    "sold_at": p.get("sold_at"),
-                    "price": price,
-                    "score": round(c.get("score", 0.0), 4)
-                })
-
-            # messages: instruct to return JSON only
-            system_msg = (
-                "You are a concise assistant that selects which past sold listing is the BEST match "
-                "for the provided user card description. Output JSON ONLY with keys: "
-                "\"chosen_index\" (integer index into candidates array or null), "
-                "\"confidence\" (number 0.0-1.0), and \"reason\" (short explanation). "
-                "If multiple candidates are equally plausible, choose the one with the most recent sold_at. "
-                "Do NOT output anything else."
-            )
-
-            user_msg = (
-                f"User card normalized: {json.dumps(user_summary, ensure_ascii=False)}\n\n"
-                f"Candidates (index, title, normalized, sold_at, price, score):\n"
-                f"{json.dumps(candidate_lines, ensure_ascii=False, indent=2)}\n\n"
-                "Return JSON only as described."
-            )
-
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg}
-                ],
-                max_tokens=256,
-                temperature=0.0,
-            )
-            # extract text
-            text = ""
-            try:
-                text = resp.choices[0].message.content
-            except Exception:
-                text = str(resp)
-
-            # try to find JSON substring
-            text_str = str(text).strip()
-            # attempt direct json parse
-            try:
-                parsed = json.loads(text_str)
-                return parsed
-            except Exception:
-                # try to find first {...} block
-                m = re.search(r"\{[\s\S]*\}", text_str)
-                if m:
-                    try:
-                        parsed = json.loads(m.group(0))
-                        return parsed
-                    except Exception:
-                        matching_logger.debug("LLM returned non-JSON or unparseable JSON: %s", text_str)
-                        return None
-                else:
-                    matching_logger.debug("LLM returned no JSON block: %s", text_str)
-                    return None
-        except Exception as e:
-            matching_logger.exception("Error calling gpt selector: %s", e)
-            return None
-
-    # prepare posts: ensure normalized dict exists
-    posts = []
-    for p in normalized_posts:
-        post = dict(p)  # shallow copy
-        raw_title = post.get("title") or post.get("name") or post.get("title_raw") or ""
-        norm = post.get("normalized")
-        if isinstance(norm, dict):
-            norm_dict = norm
-        elif isinstance(norm, str) and norm.strip():
-            # wrap string to minimal normalized dict
-            norm_dict = {"raw": raw_title, "normalized": norm}
-        else:
-            # compute normalization
-            try:
-                norm_dict = normalize_title(raw_title)
-            except Exception:
-                norm_dict = {"raw": raw_title, "normalized": raw_title}
-        post["_norm"] = norm_dict
-        post["_canonical"] = norm_dict.get("normalized") or raw_title
-        post["_sold_at_parsed"] = parse_date(post.get("sold_at"))
-        posts.append(post)
-
-    # normalize user title
-    try:
-        user_norm = normalize_title(user_card_title)
     except Exception:
-        user_norm = {"raw": user_card_title, "normalized": user_card_title}
+        # ignore and fallback to scoring+LLM selection below
+        pass
 
-    user_text = user_norm.get("normalized") or user_card_title
-
-    # build texts to embed: user + top_k candidate canonical texts (we'll limit posts for embedding to top_k by naive heuristic)
-    # NOTE: if you have precomputed embeddings, replace this block with vector DB kNN call.
-    texts = [user_text]
-    candidates_for_embedding = posts[:top_k]
-    texts.extend([p["_canonical"] for p in candidates_for_embedding])
-
-    # embedding backend: try OpenAI then fallback to sentence-transformers
-    openai_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY")
-    embeddings: List[List[float]] = []
-
-    async def embed_with_openai(ts: List[str]) -> List[List[float]]:
-        from openai import OpenAI
-        client = OpenAI(api_key=openai_key)
-        resp = client.embeddings.create(model="text-embedding-3-small", input=ts)
-        return [r.embedding for r in resp.data]
-
-    async def embed_with_st(ts: List[str]) -> List[List[float]]:
-        # runs in thread to avoid blocking event loop
-        from sentence_transformers import SentenceTransformer
-        def _encode(texts):
-            model = SentenceTransformer("all-MiniLM-L6-v2")
-            return model.encode(texts, show_progress_bar=False, convert_to_numpy=True).tolist()
-        return await asyncio.to_thread(_encode, ts)
-
-    # try embedding
-    try:
-        if openai_key:
-            embeddings = await embed_with_openai(texts)
-        else:
-            embeddings = await embed_with_st(texts)
-    except Exception:
-        # fallback
-        embeddings = await embed_with_st(texts)
-
-    user_emb = np.array(embeddings[0], dtype=np.float32)
-    cand_embs = [np.array(e, dtype=np.float32) for e in embeddings[1:]]
-
-    # compute base cosine
-    results = []
-    for i, post in enumerate(candidates_for_embedding):
-        base_sim = cosine(user_emb, cand_embs[i]) if i < len(cand_embs) else 0.0
-        results.append({
-            "post": post,
-            "base_sim": base_sim,
-            "score": base_sim,
-            "norm": post["_norm"]
+    # Build compact candidates (metadata only) to optionally send to LLM
+    compact_candidates = []
+    for idx, p in enumerate(posts_prepared):
+        compact_candidates.append({
+            "index": idx,
+            "title": p.get("name") or p.get("title") or "",
+            "metadata": p.get("_metadata") or {}
         })
 
-    # heuristics boosting weights (tunable)
-    BOOST_CARDNUMBER = 0.38
-    BOOST_SERIAL = 0.30
-    BOOST_PLAYER = 0.15
-    BOOST_YEAR = 0.06
-    BOOST_BRAND = 0.04
-
-    def norm_str(x):
-        return None if x is None else str(x).strip().lower()
-
-    u_card = norm_str(user_norm.get("card_number") or user_norm.get("card_number"))
-    u_serial = norm_str(user_norm.get("serial_numbered") or user_norm.get("serial_numbered"))
-    u_player = norm_str(user_norm.get("player_name"))
-    u_year = norm_str(user_norm.get("year"))
-    u_brand = norm_str(user_norm.get("brand"))
-
-    for r in results:
-        pn = r["norm"] or {}
-        p_card = norm_str(pn.get("card_number"))
-        p_serial = norm_str(pn.get("serial_numbered"))
-        p_player = norm_str(pn.get("player_name"))
-        p_year = norm_str(pn.get("year"))
-        p_brand = norm_str(pn.get("brand"))
-
-        score = r["base_sim"]
-        if u_card and p_card and u_card.replace("#", "") == p_card.replace("#", ""):
-            score += BOOST_CARDNUMBER
-        if u_serial and p_serial and u_serial == p_serial:
-            score += BOOST_SERIAL
-        if u_player and p_player:
-            if u_player == p_player:
-                score += BOOST_PLAYER
-            elif u_player in p_player or p_player in u_player:
-                score += BOOST_PLAYER * 0.8
-            else:
-                up_tokens = set(u_player.split())
-                pp_tokens = set(p_player.split())
-                overlap = len(up_tokens & pp_tokens)
-                if overlap > 0:
-                    score += (BOOST_PLAYER * 0.4) * (overlap / max(len(up_tokens), 1))
-        if u_year and p_year and u_year == p_year:
-            score += BOOST_YEAR
-        if u_brand and p_brand and u_brand == p_brand:
-            score += BOOST_BRAND
-
-        r["score"] = float(score)
-
-    # shortlist
-    results.sort(key=lambda x: x["score"], reverse=True)
-    shortlist = results[:shortlist_k] if len(results) > 0 else []
-
-    if not shortlist:
-        return {"found": False, "match": None, "score": 0.0, "reason": "no_candidates", "candidates": []}
-
-    # Attempt LLM selection (gpt-4o-mini) to disambiguate among shortlist
+    # Try LLM selector (synchronous wrapper) - runs in thread to avoid blocking
     llm_choice = None
     try:
-        llm_response = await call_gpt_selector(user_norm, shortlist)
-        if llm_response and isinstance(llm_response, dict):
-            # expect keys: chosen_index, confidence, reason
-            chosen_index = llm_response.get("chosen_index")
-            conf = llm_response.get("confidence")
-            reason_text = llm_response.get("reason")
-            if chosen_index is not None and isinstance(chosen_index, int) and 0 <= chosen_index < len(shortlist):
-                llm_choice = {
-                    "index": int(chosen_index),
-                    "confidence": float(conf) if conf is not None else None,
-                    "reason": reason_text
-                }
-                matching_logger.debug("LLM choice: %s", llm_choice)
-            else:
-                matching_logger.debug("LLM returned no valid chosen_index: %s", llm_response)
-        else:
-            matching_logger.debug("LLM did not return a usable response")
+        loop = asyncio.get_event_loop()
+        llm_choice = await loop.run_in_executor(None, call_gpt_selector_sync, user_meta, compact_candidates)
     except Exception:
-        matching_logger.exception("Error while using LLM selector")
+        llm_choice = None
 
-    # tie-breaker / chosen selection
-    chosen = None
-    if llm_choice:
-        chosen = shortlist[llm_choice["index"]]
-        # we still set final_score based on chosen["score"] but factor in model confidence if available
-        final_score = float(chosen["score"])
-        if llm_choice.get("confidence") is not None:
-            # combine heuristic score and model confidence conservatively (simple average)
+    chosen_post = None
+    final_score = 0.0
+    reason = ""
+
+    if llm_choice and isinstance(llm_choice, dict):
+        ci = llm_choice.get("chosen_index")
+        conf = llm_choice.get("confidence") or 0.0
+        if ci is not None:
             try:
-                conf = float(llm_choice["confidence"])
-                final_score = float(max(final_score, min(0.99, (final_score * 0.5) + (conf * 0.5))))
+                ci_int = int(ci)
+                if 0 <= ci_int < len(posts_prepared):
+                    chosen_post = posts_prepared[ci_int]
+                    final_score_raw = compare_metadata_score(user_meta, (chosen_post.get("_metadata") or {}))
+                    final_score = final_score_raw
+                    reason = f"llm_choice_conf_{conf}"
             except Exception:
-                pass
-        chosen_source = "llm"
-    else:
-        # fallback to original heuristic tie-breaker: most recent sold_at among close candidates
-        top_score = shortlist[0]["score"]
-        close_candidates = [c for c in shortlist if (top_score - c["score"]) <= 0.03]  # 0.03 tolerance
-        if len(close_candidates) > 1:
-            best = None
-            best_date = None
-            for c in close_candidates:
-                d = c["post"].get("_sold_at_parsed")
-                if d:
-                    if best_date is None or d > best_date:
-                        best = c
-                        best_date = d
-            if best is not None:
-                chosen = best
-            else:
-                chosen = shortlist[0]
+                chosen_post = None
+
+    # If no LLM choice or low confidence, do deterministic scoring across all posts
+    if not chosen_post:
+        scored = []
+        for p in posts_prepared:
+            s = compare_metadata_score(user_meta, p.get("_metadata") or {})
+            scored.append({"post": p, "score": s})
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        if not scored:
+            return {"found": False, "match": None, "score": 0.0, "reason": "no_candidates", "candidates": []}
+
+        # Take top shortlist_k
+        shortlist = scored[:shortlist_k]
+        top_score_raw = shortlist[0]["score"]
+        # raw threshold on SUM_POSSIBLE scale
+        SUM_POSSIBLE = 5.0 + 4.5 + 3.5 + 3.0 + 2.0 + 1.0 + 0.6 + 0.4
+        raw_threshold = required_confidence * SUM_POSSIBLE
+        high = [s for s in shortlist if s["score"] >= raw_threshold]
+
+        if len(high) == 1:
+            chosen_post = high[0]["post"]
+            final_score = high[0]["score"]
+            reason = "heuristic_high"
+        elif len(high) > 1:
+            # pick most recent sold_at among high
+            best = None; bestd = None
+            for h in high:
+                d = h["post"].get("_sold_at_parsed")
+                if d and (bestd is None or d > bestd):
+                    best = h["post"]; bestd = d
+            chosen_post = best or high[0]["post"]
+            final_score = max([h["score"] for h in high])
+            reason = "heuristic_tiebreak_sold_at"
         else:
-            chosen = shortlist[0]
-        final_score = chosen["score"]
-        chosen_source = "heuristic"
+            # maybe accept top if exact card or serial present
+            top = shortlist[0]
+            top_meta = top["post"].get("_metadata") or {}
+            def n(x): return "" if not x else re.sub(r"\s+"," ",re.sub(r"[^\w\/#\-]"," ",str(x))).strip().lower()
+            u_card = n(user_meta.get("Card Number")); p_card = n(top_meta.get("Card Number"))
+            u_serial_full = n(user_meta.get("Serial Full")); p_serial_full = n(top_meta.get("Serial Full"))
+            u_serial_code = n(user_meta.get("Serial Numbered")); p_serial_code = n(top_meta.get("Serial Numbered"))
+            if u_card and p_card and u_card.replace(" ", "") == p_card.replace(" ", ""):
+                chosen_post = top["post"]; final_score = top["score"]; reason = "card_number_exact"
+            elif u_serial_full and p_serial_full and u_serial_full == p_serial_full:
+                chosen_post = top["post"]; final_score = top["score"]; reason = "serial_full_exact"
+            elif u_serial_run and ( (top_meta.get("Serial Run") and top_meta.get("Serial Run") == u_serial_run) or (top_meta.get("Card Number") and "/" in top_meta.get("Card Number") and top_meta.get("Card Number").split("/")[-1] == u_serial_run) ):
+                chosen_post = top["post"]; final_score = top["score"]; reason = "serial_run_match"
+            else:
+                # no suitable match
+                # prepare compact candidates output for debugging
+                out_candidates = []
+                for c in shortlist:
+                    out_candidates.append({
+                        "title": c["post"].get("name") or c["post"].get("title"),
+                        "normalized": c["post"].get("_normalized"),
+                        "metadata": c["post"].get("_metadata"),
+                        "score_raw": round(float(c["score"]), 4)
+                    })
+                return {"found": False, "match": None, "score": round(float(top["score"]/SUM_POSSIBLE),4), "reason": "below_threshold", "candidates": out_candidates}
 
-    # final score adjustments: if exact strong signals, force high confidence
-    pn = chosen["norm"] or {}
-    p_card = norm_str(pn.get("card_number"))
-    p_player = norm_str(pn.get("player_name"))
-    if u_card and p_card and u_card.replace("#", "") == p_card.replace("#", "") and u_player and p_player and (u_player == p_player or u_player in p_player or p_player in u_player):
-        final_score = max(final_score, 0.98)
+    # normalize final_score to 0..1
+    SUM_POSSIBLE = 5.0 + 4.5 + 3.5 + 3.0 + 2.0 + 1.0 + 0.6 + 0.4
+    normalized_final_score = float(max(0.0, min(1.0, final_score / SUM_POSSIBLE)))
 
-    final_score = float(max(0.0, min(final_score, 1.0)))
-    found = final_score >= required_confidence
+    # if multiple posts have normalized score >= required_confidence -> pick most recent among them
+    all_scored = []
+    for p in posts_prepared:
+        s = compare_metadata_score(user_meta, p.get("_metadata") or {})
+        all_scored.append({"post": p, "score": s})
+    multi_high = [s for s in all_scored if (s["score"] / SUM_POSSIBLE) >= required_confidence]
+    if len(multi_high) > 1:
+        best = None; bestd = None
+        for s in multi_high:
+            d = s["post"].get("_sold_at_parsed")
+            if d and (bestd is None or d > bestd):
+                best = s["post"]; bestd = d
+        if best:
+            chosen_post = best
 
-    reason_parts = []
-    reason_parts.append("accepted" if found else "below_threshold")
-    reason_parts.append("selection_source=" + chosen_source)
-    if chosen_source == "llm" and llm_choice:
-        reason_parts.append(f"llm_confidence={llm_choice.get('confidence')}")
-        if llm_choice.get("reason"):
-            reason_parts.append("llm_reason=" + llm_choice.get("reason"))
+    # found should be True if we have a chosen_post, regardless of confidence score
+    # because exact matches (card number, serial) can override confidence requirements
+    found = chosen_post is not None
 
-    heuristics = []
-    if u_card and p_card and u_card.replace("#", "") == p_card.replace("#", ""):
-        heuristics.append("card_number_match")
-    if u_serial and p_serial and u_serial == p_serial:
-        heuristics.append("serial_match")
-    if u_player and p_player and (u_player == p_player or u_player in p_player or p_player in u_player):
-        heuristics.append("player_match")
-    if u_year and p_year and u_year == p_year:
-        heuristics.append("year_match")
-    if heuristics:
-        reason_parts.append("heuristics=" + ",".join(heuristics))
-
-    # prepare candidates list for output
-    out_candidates = []
-    for c in shortlist:
-        out_candidates.append({
-            "id": c["post"].get("id"),
-            "title": c["post"].get("title") or c["post"].get("name"),
-            "sold_at": c["post"].get("sold_at"),
-            "score": round(c["score"], 4),
-            "normalized": c["norm"],
-            "price": extract_price(c["post"])
+    # prepare top candidates list (compact)
+    final_candidates = []
+    scored_all_sorted = sorted(all_scored, key=lambda x: x["score"], reverse=True)
+    for c in scored_all_sorted[:shortlist_k]:
+        final_candidates.append({
+            "title": c["post"].get("name") or c["post"].get("title"),
+            "normalized": c["post"].get("_normalized"),
+            "metadata": c["post"].get("_metadata"),
+            "score_raw": round(float(c["score"]), 4)
         })
 
-    chosen_post = chosen["post"]
-    matching_logger.debug("Found 1 candidate most likely: %s", user_card_title)
-
-    matching_logger.debug(
-        f'Found 1 candidate most likely: "{user_card_title}"\n'
-        f'Candidate: {chosen_post}'
-    )
     return {
-        "found": found,
+        "found": False if not chosen_post else True,
         "match": chosen_post,
-        "score": round(final_score, 4),
-        "reason": "; ".join(reason_parts),
-        "candidates": out_candidates
+        "score": round(normalized_final_score, 4),
+        "reason": reason or ("llm_selected" if llm_choice else "heuristic"),
+        "candidates": final_candidates
     }

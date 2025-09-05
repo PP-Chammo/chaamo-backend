@@ -579,7 +579,17 @@ async def select_best_ebay_post(posts: List[Dict], user_query: str) -> Optional[
         return None
 
     # Use robust card matcher to find best match
-    return await get_last_sold_item(user_query, posts)
+    result = await get_last_sold_item(user_query, posts)
+
+    print("--------------------------")
+    print(f'Found: {result["found"]}')
+    print(f'Match: {result["match"]}')
+    print(f'score: {result["score"]}')
+    print(f'reason: {result["reason"]}')
+    print(f'candidates: {result["candidates"]}')
+    print("--------------------------")
+
+    return result
 
 
 # ==============================================================================
@@ -671,11 +681,13 @@ async def update_user_card(selected_post: Dict, user_card_id: str) -> Dict:
 
     try:
         update_data = {
-            "last_sold_price": selected_post.get("sold_price"),
-            "last_sold_currency": selected_post.get("sold_currency"),
-            "last_sold_at": selected_post.get("sold_date"),
-            "last_sold_post_url": selected_post.get("sold_post_url"),
+            "last_sold_price": selected_post["sold_price"],
+            "last_sold_currency": selected_post["sold_currency"],
+            "last_sold_at": selected_post["sold_date"],
+            "last_sold_post_url": selected_post["sold_post_url"],
         }
+        
+        print(user_card_id, update_data)
 
         supabase.table("user_cards").update(update_data).eq(
             "id", user_card_id
@@ -784,18 +796,19 @@ class EbayScraper:
                     f"🔍 Using resolved query for matching: '{resolved_query}'"
                 )
 
-                selected_post = await select_best_ebay_post(
+                matching_result = await select_best_ebay_post(
                     posts=posts, user_query=resolved_query
                 )
-                return selected_post
 
-                if selected_post:
+                # Extract the actual matched post from the result structure
+                if matching_result and matching_result.get("match"):
+                    selected_post = matching_result["match"]
                     user_update_results = await update_user_card(
                         selected_post=selected_post, user_card_id=user_card_id
                     )
                     results["user_update_results"] = user_update_results
                     scraper_logger.info(
-                        f"🎯 User card mode: updated {user_card_id} with best match"
+                        f"🎯 User card mode: updated {user_card_id} with best match (score: {matching_result.get('score', 0)}, found: {matching_result.get('found', False)})"
                     )
                 else:
                     scraper_logger.info(

@@ -148,7 +148,7 @@ async def httpx_get_content(
     params: Optional[dict[str, str]] = None,
     headers: Optional[dict[str, str]] = None,
     *,
-    attempts: int = 5,
+    attempts: int = 2,
     request_timeout: float = 25.0,
     jitter_min: float = 0.6,
     jitter_max: float = 1.5,
@@ -181,14 +181,17 @@ async def httpx_get_content(
     from src.utils.logger import setup_logger
     logger = setup_logger("chaamo.httpx")
 
-    # Try proxy first, fallback to direct if proxy array is empty
+    # Try proxy first with SSL fallback strategy
     connection_attempts = []
     if use_proxy:
-        # Try Zyte proxy first if available
+        # Try Zyte proxy with SSL fallback strategy
         zyte_proxy = get_zyte_proxy()
         if zyte_proxy:
-            connection_attempts.append(("zyte", zyte_proxy))
-            logger.info("🟢 Using Zyte proxy")
+            # First try Zyte with SSL verification
+            connection_attempts.append(("zyte_ssl", zyte_proxy))
+            # Then try Zyte without SSL verification
+            connection_attempts.append(("zyte_no_ssl", zyte_proxy))
+            logger.info("🟢 Using Zyte proxy with SSL fallback strategy")
         else:
             # Fallback to traditional proxies
             proxy_url = get_random_proxy()
@@ -198,39 +201,44 @@ async def httpx_get_content(
                 connection_attempts.append(("direct", None))
                 logger.info("🔄 Proxy list is empty, using direct connection fallback")
 
-    # If no proxy available but proxy list exists, still try direct as last resort
-    if not connection_attempts:
-        connection_attempts.append(("direct", None))
-        logger.warning("⚠️ No proxies available, falling back to direct connection")
+    # Always add direct connection as final fallback
+    connection_attempts.append(("direct", None))
 
     for connection_type, proxy_config in connection_attempts:
-        if connection_type == "zyte":
-            logger.info("🟢 Trying Zyte proxy")
+        # Log connection attempt
+        if connection_type == "zyte_ssl":
+            logger.info("🔐 Trying Zyte proxy with SSL verification")
+        elif connection_type == "zyte_no_ssl":
+            logger.info("🔓 Trying Zyte proxy without SSL verification")
         elif connection_type == "proxy":
-            logger.info(f"🌐 Trying proxy: {proxy_config}")
+            logger.info(f"🌐 Trying traditional proxy: {proxy_config}")
         else:
             logger.info(f"🔗 Trying direct connection")
 
         use_http2 = bool(random.getrandbits(1))
         limits = httpx.Limits(
-            max_keepalive_connections=5, max_connections=10, keepalive_expiry=30.0
+            max_keepalive_connections=3, max_connections=10, keepalive_expiry=30.0
         )
 
         try:
             # Configure SSL verification and proxy settings
-            verify_ssl = True
+            verify_ssl = False
             proxy_setting = None
             
-            if connection_type == "zyte":
-                # Zyte proxy uses CA certificate in production
-                verify_ssl = "/usr/local/share/ca-certificates/zyte-ca.crt" if os.path.exists("/usr/local/share/ca-certificates/zyte-ca.crt") else False
-                proxy_setting = proxy_config  # This is a string URL for Zyte
-                if verify_ssl == True:
-                    logger.info("🔐 Using system SSL verification for Zyte proxy")
-                else:
-                    logger.info("🔐 Using Zyte CA certificate for SSL verification")
+            if connection_type == "zyte_ssl":
+                # Zyte proxy with SSL verification enabled
+                verify_ssl = "/usr/local/share/ca-certificates/zyte-ca.crt" if os.path.exists("/usr/local/share/ca-certificates/zyte-ca.crt") else True
+                proxy_setting = proxy_config
+                logger.info("🔐 Using SSL verification for Zyte proxy")
+            elif connection_type == "zyte_no_ssl":
+                # Zyte proxy with SSL verification disabled
+                verify_ssl = False
+                proxy_setting = proxy_config
+                logger.info("🔓 Disabling SSL verification for Zyte proxy")
             elif connection_type == "proxy":
-                proxy_setting = proxy_config  # This is a string URL
+                # Traditional proxy without SSL verification
+                verify_ssl = False
+                proxy_setting = proxy_config
 
             async with httpx.AsyncClient(
                 headers=headers,
@@ -247,37 +255,14 @@ async def httpx_get_content(
                     client, url, params, headers, attempts, connection_type
                 )
                 if success:
+                    logger.info(f"✅ {connection_type} connection successful")
                     return success
         except Exception as e:
             logger.warning(f"⚠️ {connection_type} connection failed: {e}")
             continue
 
-    # If all connection attempts failed, try direct connection as final fallback
-    if use_proxy:
-        logger.warning("❌ All proxy attempts failed, trying direct connection as final fallback")
-        try:
-            use_http2 = bool(random.getrandbits(1))
-            limits = httpx.Limits(
-                max_keepalive_connections=5, max_connections=10, keepalive_expiry=30.0
-            )
-            timeout = httpx.Timeout(random.uniform(12.0, 18.0), pool=5.0)
-            
-            async with httpx.AsyncClient(
-                http2=use_http2,
-                limits=limits,
-                timeout=timeout,
-                max_redirects=10,
-                follow_redirects=True,
-            ) as client:
-                response = await _attempt_requests(
-                    client, url, params, headers, attempts, "direct fallback"
-                )
-                if response:
-                    logger.info("✅ Direct fallback connection successful")
-                    return response
-        except Exception as e:
-            logger.error(f"❌ Direct fallback also failed: {e}")
-    
+    # If all connection attempts failed
+    logger.error("❌ All connection attempts failed (Zyte SSL -> Zyte no-SSL -> Direct)")
     return ""
 
 
