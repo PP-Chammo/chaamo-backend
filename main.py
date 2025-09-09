@@ -3,12 +3,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from src.api.v1 import router as v1_endpoint
 from src.scheduler import start_ebay_cronjob, stop_ebay_cronjob
-import atexit
+from src.utils.playwright import ensure_playwright_browsers
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    ensure_playwright_browsers()
     print("🕐 Starting eBay cronjob scheduler...")
     start_ebay_cronjob()
     yield

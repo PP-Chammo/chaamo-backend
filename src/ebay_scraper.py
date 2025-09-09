@@ -1,26 +1,13 @@
-import os
-import asyncio
-import math
-import random
-import re
 import uuid
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, Optional, Any
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from dataclasses import dataclass
-from urllib.parse import urlencode
-import json
-
-import dateutil.parser as date_parser
-import pytz
-from bs4 import BeautifulSoup
-import httpx
 
 from src.utils.logger import get_logger
 from src.models.category import CategoryId
-from src.models.ebay import Region, base_target_url
-from src.utils.httpx import httpx_get_content
+from src.models.ebay import Region
 from src.utils.supabase import supabase
 from src.utils.scraper import (
     scrape_ebay_html,
@@ -86,7 +73,7 @@ class EbayScraper:
             html_pages = await scrape_ebay_html(
                 region=region,
                 query=query,
-                category_id=category_id,
+                category_id=category_id.value,
                 user_card_id=user_card_id,
                 max_pages=max_pages,
                 page_retries=page_retries,
@@ -237,7 +224,7 @@ class EbayWorkerManager:
     ) -> WorkerTask:
         task_id = str(uuid.uuid4())
         final_query = query or "card"
-        final_category_id = category_id or CategoryId.PANINI
+        final_category_id = category_id or CategoryId.TOPPS
         task = WorkerTask(
             id=task_id,
             query=final_query,

@@ -3,11 +3,6 @@ import asyncio
 import math
 import random
 import re
-import uuid
-from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple
-from urllib.parse import urlencode
-import json
 import unicodedata
 import difflib
 
@@ -24,7 +19,6 @@ from src.utils.supabase import supabase
 
 scraper_logger = get_logger("scraper")
 
-# Try to import rapidfuzz (optional). If available, use it for better fuzzy matching.
 try:
     from rapidfuzz import process, fuzz  # type: ignore
 
@@ -32,7 +26,6 @@ try:
 except Exception:
     _HAS_RAPIDFUZZ = False
 
-# Starter lookups (extend externally if perlu)
 DEFAULT_SET_NAMES = [
     "Panini Prizm",
     "Topps Chrome",
@@ -140,7 +133,7 @@ def _normalize_text(s: str) -> str:
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower()
-    # replace weird punctuation with spaces except slash
+    # replace weird punctuation with spaces except slash and numbers
     s = re.sub(r"[^a-z0-9/ ]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -152,11 +145,12 @@ def _normalize_text(s: str) -> str:
 
 
 def _fuzzy_best_match(
-    candidate: str, choices: List[str]
-) -> Tuple[Optional[str], float]:
+    candidate: str, choices: list[str]
+) -> tuple[str | None, float]:
     if not candidate or not choices:
         return None, 0.0
     if _HAS_RAPIDFUZZ:
+        # Use token_set_ratio for better handling of word order variations
         best = process.extractOne(candidate, choices, scorer=fuzz.token_set_ratio)
         if best:
             name, score, _ = best
@@ -178,8 +172,8 @@ def _fuzzy_best_match(
 
 
 def normalize_card_title(
-    title: str, set_names: Optional[List[str]] = None, fuzzy_threshold: float = 75.0
-) -> Dict[str, Any]:
+    title: str, set_names: list[str] | None = None, fuzzy_threshold: float = 80.0
+) -> dict[str, any]:
     """
     Parse a raw title and return a dict with fixed keys:
     {
@@ -330,7 +324,7 @@ def normalize_card_title(
     # If no direct match, try fuzzy matching with lower threshold
     if not found_set:
         best_name, score = _fuzzy_best_match(norm, set_names)
-        if best_name and score >= 50.0:  # Lowered from 75% to 50%
+        if best_name and score >= fuzzy_threshold:  
             found_set = best_name
             set_score = score / 100.0
             norm = norm.replace(best_name.lower(), "")
@@ -371,7 +365,7 @@ EMBED_BATCH = int(os.getenv("EMBED_BATCH", "128"))
 # ===============================================================
 
 
-def _cosine_sim(a: List[float], b: List[float]) -> float:
+def _cosine_sim(a: list[float], b: list[float]) -> float:
     # returns similarity in [-1..1]
     if not a or not b or len(a) != len(b):
         return -1.0
@@ -394,8 +388,8 @@ def _cosine_sim(a: List[float], b: List[float]) -> float:
 
 
 async def _openai_post(
-    path: str, payload: Dict[str, Any], timeout: int = 30
-) -> Dict[str, Any]:
+    path: str, payload: dict[str, any], timeout: int = 30
+) -> dict[str, any]:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not set")
     headers = {
@@ -414,7 +408,7 @@ async def _openai_post(
 # ===============================================================
 
 
-async def embed_texts(texts: List[str], model: str = None) -> List[List[float]]:
+async def embed_texts(texts: list[str], model: str = None) -> list[list[float]]:
     model = model or EMBED_MODEL
     if not texts:
         return []
@@ -452,13 +446,13 @@ async def gpt_rerank_prompt(
 
 async def scrape_ebay_html(
     region: Region,
-    query: Optional[str] = None,
-    category_id: Optional[CategoryId] = None,
-    user_card_id: Optional[str] = None,
+    query: str | None = None,
+    category_id: CategoryId | None = None,
+    user_card_id: str | None = None,
     max_pages: int = 50,
     page_retries: int = 3,
     disable_proxy: bool = False,
-) -> List[str]:
+) -> list[str]:
     # (same logic as before) - build config, request first page to determine total pages, loop pages
     final_query = query or "card"
     final_category_id = category_id
@@ -602,9 +596,9 @@ async def scrape_ebay_html(
 
 
 async def extract_ebay_post_data(
-    html_pages: List[str], region: str, category_id: Optional[int] = None
-) -> List[Dict[str, Any]]:
-    all_posts: List[Dict[str, Any]] = []
+    html_pages: list[str], region: str, category_id: int | None = None
+) -> list[dict[str, any]]:
+    all_posts: list[dict[str, any]] = []
     for html in html_pages:
         soup = BeautifulSoup(html, "html.parser")
         items = soup.select("li[data-listingid]")
@@ -746,7 +740,7 @@ async def extract_ebay_post_data(
                         break
                 tags = clean_tags
 
-                post_data: Dict[str, Any] = {
+                post_data: dict[str, any] = {
                     "id": listing_id,
                     "title": title,
                     "image_url": image_url,
@@ -782,7 +776,7 @@ async def extract_ebay_post_data(
 
     # dedupe by url
     seen_urls = set()
-    unique_posts: List[Dict[str, Any]] = []
+    unique_posts: list[dict[str, any]] = []
     for post in all_posts:
         url = post.get("sold_post_url", "")
         if url and url not in seen_urls:
@@ -801,14 +795,14 @@ async def extract_ebay_post_data(
 
 
 async def embed_posts(
-    posts: List[Dict[str, Any]], batch_size: int = EMBED_BATCH
+    posts: list[dict[str, any]], batch_size: int = EMBED_BATCH
 ) -> None:
     if not posts:
         return
 
     model = EMBED_MODEL
     texts = [p["metadata"]["normalized_attributes"]["normalized_title"] for p in posts]
-    embeddings: List[List[float]] = []
+    embeddings: list[list[float]] = []
     # batch
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
@@ -827,34 +821,61 @@ async def embed_posts(
 
 
 # ===============================================================
-# Step 3: NN search (top-k) + optional GPT rerank
+# Selection Last Sold By AI (Post Ranking)
 # ===============================================================
 
 
 async def select_best_ebay_post(
-    posts: List[Dict[str, Any]],
+    posts: list[dict[str, any]],
     user_query: str,
     top_k: int = 5,
     rerank_with_gpt: bool = True,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, any] | None:
     """Select best eBay post using precise attribute matching + embedding similarity."""
     if not posts:
         return None
 
     scraper_logger.info(f"🎯 Starting selection from {len(posts)} posts...")
 
-    # Limit posts to prevent timeout (take first 100 for efficiency)
-    if len(posts) > 100:
-        scraper_logger.info(f"⚡ Limiting to first 100 posts for efficiency")
-        posts = posts[:100]
-
     # Normalize user query to extract attributes
     user_attrs = normalize_card_title(user_query)
     # scraper_logger.info(f"🔍 Extracted user attributes: {user_attrs}")
 
+    # Extract exact match criteria from user_attrs
+    user_year = user_attrs.get('year')
+    user_set = user_attrs.get('set')
+    user_player = user_attrs.get('player_or_character')
+
+    # Filter posts that match exactly on year, set, and player (if they are specified)
+    filtered_posts = []
+    for post in posts:
+        post_attrs = post.get("metadata", {}).get("normalized_attributes", {})
+        # Check year
+        if user_year is not None and post_attrs.get('year') != user_year:
+            continue
+        # Check set
+        if user_set is not None and post_attrs.get('set') != user_set:
+            continue
+        # Check player/character
+        if user_player is not None and post_attrs.get('player_or_character') != user_player:
+            continue
+        filtered_posts.append(post)
+
+    # If no posts match the exact criteria, fall back to all posts
+    if not filtered_posts:
+        scraper_logger.info("No exact matches found for year, set, and player. Falling back to all posts.")
+        filtered_posts = posts
+    else:
+        scraper_logger.info(f"Filtered to {len(filtered_posts)} posts with exact matches for year, set, and player.")
+
+    # Limit posts to prevent timeout (take first 100 for efficiency)
+    if len(filtered_posts) > 100:
+        scraper_logger.info(f"⚡ Limiting to first 100 posts for efficiency")
+        filtered_posts = filtered_posts[:100]
+
     # Score posts using attribute matching + embedding similarity
     scored = []
-    for i, post in enumerate(posts):
+    for i, post in enumerate(filtered_posts):
         post_attrs = post.get("metadata", {}).get("normalized_attributes", {})
 
         # Calculate attribute match score (0-1)
@@ -913,10 +934,10 @@ async def select_best_ebay_post(
         "found": True,
         "match": {
             "title": best_post.get("title", ""),
-            "sold_price": best_post.get("sold_price", 0),
-            "sold_currency": best_post.get("sold_currency", "USD"),
-            "sold_post_url": best_post.get("sold_post_url", ""),
-            "sold_at": best_post.get("sold_at", ""),
+            "sold_price": best_post.get("sold_price"),
+            "sold_currency": best_post.get("sold_currency"),
+            "sold_post_url": best_post.get("sold_post_url"),
+            "sold_at": best_post.get("sold_at"),
             "similarity": best_score,
             "attribute_score": best_attr,
             "embedding_score": best_embed,
@@ -932,8 +953,13 @@ async def select_best_ebay_post(
     }
 
 
+# ===============================================================
+# Attribute Matching
+# ===============================================================
+
+
 def _calculate_attribute_match_score(
-    user_attrs: Dict[str, Any], post_attrs: Dict[str, Any]
+    user_attrs: dict[str, any], post_attrs: dict[str, any]
 ) -> float:
     """Calculate precise attribute match score between user query and post."""
     score = 0.0
@@ -999,7 +1025,12 @@ def _calculate_attribute_match_score(
     return score / total_weight if total_weight > 0 else 0.0
 
 
-def _extract_year(text: str) -> Optional[str]:
+# ===============================================================
+# Helper Functions
+# ===============================================================
+
+
+def _extract_year(text: str) -> str | None:
     """Extract year from card title, handling season ranges like 2024-25."""
     import re
 
@@ -1009,7 +1040,26 @@ def _extract_year(text: str) -> Optional[str]:
     return year_match.group(1) if year_match else None
 
 
-def _extract_serial_number(text: str) -> Optional[str]:
+def _extract_year_range(text: str) -> list[str]:
+    # extract year pattern at the start, can be 1994 or 1994-96
+    m = re.match(r"(\d{4})(?:-(\d{2,4}))?", text)
+    if not m:
+        return []
+
+    start = int(m.group(1))
+    end_str = m.group(2)
+
+    if end_str:
+        if len(end_str) == 2:
+            end = int(str(start)[:2] + end_str)
+        else:
+            end = int(end_str)
+        return [str(y) for y in range(start, end + 1)]
+    else:
+        return [str(start)]
+
+
+def _extract_serial_number(text: str) -> str | None:
     """Extract serial number like /25, #123, 048/299, avoiding year ranges like 2024-25."""
     import re
 
@@ -1039,16 +1089,13 @@ def _extract_serial_number(text: str) -> Optional[str]:
 
 
 # ===============================================================
-
-
-# ===============================================================
-# Step 4: store (supabase) + update user_cards if needed
+# Step 4: upsert ebay_posts (supabase) + update user_cards if user_card_id mode
 # ===============================================================
 
 
 async def upsert_ebay_listings(
-    posts: List[Dict[str, Any]], user_card_id: Optional[str] = None
-) -> Dict[str, Any]:
+    posts: list[dict[str, any]], user_card_id: str | None = None
+) -> dict[str, any]:
     """
     Upsert posts into supabase table `ebay_posts`. If embedding present, store it in embedding column.
     """
@@ -1108,8 +1155,8 @@ async def upsert_ebay_listings(
 
 
 async def update_user_card(
-    selected_post: Dict[str, Any], user_card_id: str
-) -> Dict[str, Any]:
+    selected_post: dict[str, any], user_card_id: str
+) -> dict[str, any]:
     results = {"user_card_updated": False, "errors": []}
     try:
         update_data = {
@@ -1129,3 +1176,105 @@ async def update_user_card(
         results["errors"].append(str(e))
         scraper_logger.error(f"❌ Failed update user_cards: {e}")
     return results
+
+
+# ===============================================================
+# Upsert card_sets (supabase)
+# ===============================================================
+# NOTE: this module expects `supabase` client to be available (same as project).
+# Upsert functions now return a dict with explicit 'count' and 'records'.
+async def upsert_card_sets(card_sets: list[dict[str, any]]) -> dict[str, any]:
+    """
+    Upsert card_sets into supabase table `card_sets`.
+    Return:
+      {
+        "count": int,            # number of records returned by supabase (accumulated)
+        "records": List[Dict],   # list of returned representations
+        "errors": List[str]      # errors, if any
+      }
+    """
+    results = {"count": 0, "records": [], "errors": []}
+    if not card_sets:
+        return results
+
+    try:
+        db_records = []
+        for card_set in card_sets:
+            db_record = {
+                "name": card_set.get("name", ""),
+                "category_id": card_set.get("category_id", ""),
+                "platform": card_set.get("platform", ""),
+                "platform_set_id": card_set.get("platform_set_id", ""),
+                "years": card_set.get("years", []),
+                "link": card_set.get("link", ""),
+                "browse_type": card_set.get("browse_type", ""),
+            }
+            db_records.append(db_record)
+
+        # upsert in batches, accumulate returned representations
+        BATCH = 500
+        for i in range(0, len(db_records), BATCH):
+            batch = db_records[i : i + BATCH]
+            resp = supabase.table("card_sets").upsert(
+                batch, on_conflict="platform_set_id", returning="representation"
+            ).execute()
+            batch_records = resp.data or []
+            results["records"].extend(batch_records)
+            results["count"] += len(batch_records)
+
+        scraper_logger.info(f"✅ Upserted {results['count']} sets to card_sets")
+        return results
+    except Exception as e:
+        results["errors"].append(str(e))
+        scraper_logger.error(f"❌ Failed to upsert card_sets: {e}")
+        return results
+
+
+# ===============================================================
+# Upsert master_cards (supabase)
+# ===============================================================
+async def upsert_master_cards(cards: list[dict[str, any]]) -> dict[str, any]:
+    """
+    Upsert cards into supabase table `master_cards`.
+    Return structure same as upsert_card_sets: {count, records, errors}
+    """
+    results = {"count": 0, "records": [], "errors": []}
+    if not cards:
+        return results
+
+    try:
+        db_records = []
+        for card in cards:
+            years = card.get("years", []) or []
+            db_record = {
+                "category_id": card.get("category_id", ""),
+                "set_id": card.get("set_id", ""),
+                "platform": card.get("platform", ""),
+                "platform_card_id": card.get("platform_card_id", ""),
+                "name": card.get("name", ""),
+                "card_number": card.get("card_number", ""),
+                "canonical_image_url": card.get("canonical_image_url", ""),
+                "link": card.get("link", ""),
+                "attributes": card.get("attributes", {}),
+                "years": years,
+                "year": years[0] if years else None,
+            }
+            db_records.append(db_record)
+
+        # upsert in batches, accumulate returned representations
+        BATCH = 500
+        for i in range(0, len(db_records), BATCH):
+            batch = db_records[i : i + BATCH]
+            resp = supabase.table("master_cards").upsert(
+                batch, on_conflict="platform_card_id", returning="representation"
+            ).execute()
+            batch_records = resp.data or []
+            results["records"].extend(batch_records)
+            results["count"] += len(batch_records)
+
+        scraper_logger.info(f"✅ Upserted {results['count']} cards to master_cards")
+        return results
+    except Exception as e:
+        results["errors"].append(str(e))
+        scraper_logger.error(f"❌ Failed to upsert master_cards: {e}")
+        return results
