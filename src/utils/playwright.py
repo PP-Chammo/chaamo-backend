@@ -7,7 +7,7 @@ from typing import Optional
 from urllib.parse import urlencode
 
 import playwright_stealth
-from playwright_stealth import Stealth
+from playwright_stealth import stealth as Stealth
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from src.utils.logger import get_logger

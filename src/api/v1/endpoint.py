@@ -1,28 +1,28 @@
-import os
 import asyncio
-import shippo
-import re
-from shippo.models import components
-from typing import Optional, List
-from urllib.parse import urlencode
-from dotenv import load_dotenv
-from fastapi import APIRouter, Query, HTTPException, Request, Depends, status
-import httpx
-from starlette.responses import RedirectResponse
+from typing import Optional, List, Dict, Any
+from fastapi import APIRouter, Query, HTTPException, Request, Depends
 
 from src.ebay_scraper import worker_manager as ebay_worker_manager
 from src.tcdb_scraper import tcdb_scrape_handler
+from src.paypal_handlers import (
+    paypal_subscription_handler,
+    paypal_subscription_return_handler,
+    paypal_webhook_subscription_handler,
+    paypal_order_handler,
+    paypal_order_return_handler,
+    paypal_webhook_order_handler,
+    paypal_cancel_handler,
+)
+from src.shippo_handlers import shippo_rates_handler, shippo_webhook_handler
 from src.models.ebay import Region
 from src.models.tcdb import BrowseDropdown
-from src.models.shippo import RateOption, RateRequest
+from src.models.shippo import RateResponse, TransactionPayload
 from src.models.category import CategoryId, CategoryDropdown
 from src.models.api import (
     WorkerListResponse,
     WorkerTaskResponse,
     ScrapeStartResponse,
 )
-from src.utils.supabase import supabase
-from src.utils.paypal import create_order, capture_order
 from src.utils.logger import (
     api_logger,
     log_api_request,
@@ -31,11 +31,6 @@ from src.utils.logger import (
 )
 
 router = APIRouter()
-
-load_dotenv()
-
-SHIPPO_API_KEY = os.environ.get("SHIPPO_API_KEY")
-SHIPPO_ALLOWED_PROVIDERS = os.environ.get("SHIPPO_ALLOWED_PROVIDERS")
 
 
 # Dependency injection
@@ -318,91 +313,67 @@ async def get_worker_status(task_id: str, manager=Depends(get_worker_manager)):
 
 
 # ===============================================================
-# PAYPAL CHECKOUT
+# PAYPAL ENDPOINT
 # ===============================================================
 
 
-def _base_url(request: Request) -> str:
-    # e.g. https://chaamo-backend.fly.dev
-    return str(request.base_url).rstrip("/")
-
-
-@router.get("/paypal/checkout", summary="Start PayPal checkout")
-async def paypal_checkout(
+@router.get("/paypal/subscription", summary="Start PayPal checkout")
+async def paypal_subscription(
     request: Request,
-    amount: str = Query("1.00", description="Payment amount as string, e.g. '1.00'"),
-    currency: str = Query("USD", description="Currency code, e.g. 'USD'"),
+    user_id: str = Query(..., description="User ID"),
+    plan_id: str = Query(..., description="Plan ID"),
     redirect: str = Query(
         ..., description="App redirect deep link to return to after payment"
     ),
 ):
-    log_api_request(
-        api_logger, "GET", "/paypal/checkout", {"amount": amount, "currency": currency}
+    return await paypal_subscription_handler(
+        request=request,
+        user_id=user_id,
+        plan_id=plan_id,
+        redirect=redirect,
     )
 
-    try:
-        base = _base_url(request)
-        return_url = f"{base}/api/v1/paypal/return?{urlencode({'redirect': redirect})}"
-        cancel_url = f"{base}/api/v1/paypal/cancel?{urlencode({'redirect': redirect})}"
 
-        api_logger.info(f"💰 Creating PayPal order: {amount} {currency}")
-        order = await create_order(
-            amount=amount,
-            currency=currency,
-            return_url=return_url,
-            cancel_url=cancel_url,
-        )
-
-        links = order.get("links", [])
-        approval = next(
-            (l for l in links if l.get("rel") in ("approve", "payer-action")), None
-        )
-        if not approval or not approval.get("href"):
-            api_logger.error("❌ Failed to create PayPal approval link")
-            raise HTTPException(
-                status_code=502, detail="Failed to create PayPal approval link"
-            )
-
-        api_logger.info(f"✅ PayPal order created, redirecting to approval")
-        return RedirectResponse(url=approval["href"], status_code=302)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log_error_with_context(api_logger, e, "PayPal checkout")
-        raise HTTPException(status_code=500, detail=f"Checkout error: {e}")
+@router.get("/paypal/subscription/return", summary="PayPal capture return URL")
+async def paypal_subscription_return(
+    redirect: str = Query(..., description="Original app redirect deep link"),
+    user_id: str = Query(..., description="User ID"),
+    plan_id: str = Query(..., description="Plan ID"),
+    subscription_id: Optional[str] = Query(
+        None, description="PayPal subscription ID token"
+    ),
+):
+    return await paypal_subscription_return_handler(
+        redirect=redirect,
+        user_id=user_id,
+        plan_id=plan_id,
+        subscription_id=subscription_id,
+    )
 
 
-@router.get("/paypal/return", summary="PayPal return URL")
+@router.post("/paypal/webhook/subscription")
+async def paypal_webhooks(request: Request):
+    return await paypal_webhook_subscription_handler(request=request)
+
+
+@router.post("/paypal/order")
+async def create_paypal_order(
+    request: Request, payload: TransactionPayload
+) -> Dict[str, Any]:
+    return await paypal_order_handler(request=request, payload=payload)
+
+
+@router.get("/paypal/order/return", summary="PayPal return URL")
 async def paypal_return(
     redirect: str = Query(..., description="Original app redirect deep link"),
     token: Optional[str] = Query(None, description="PayPal order ID token"),
     PayerID: Optional[str] = Query(None, description="PayPal payer ID (may be absent)"),
 ):
-    log_api_request(api_logger, "GET", "/paypal/return", {"token": token})
-
-    if not token:
-        api_logger.warning("❌ PayPal return without token")
-        params = urlencode({"status": "error"})
-        return RedirectResponse(
-            url=f"{redirect}{'&' if '?' in redirect else '?'}{params}", status_code=302
-        )
-
-    try:
-        api_logger.info(f"💰 Capturing PayPal order: {token}")
-        await capture_order(order_id=token)
-        api_logger.info(f"✅ PayPal payment captured successfully: {token}")
-
-        params = urlencode({"status": "success", "orderId": token})
-        return RedirectResponse(
-            url=f"{redirect}{'&' if '?' in redirect else '?'}{params}", status_code=302
-        )
-    except Exception as e:
-        log_error_with_context(api_logger, e, f"capturing PayPal order {token}")
-        params = urlencode({"status": "error", "orderId": token})
-        return RedirectResponse(
-            url=f"{redirect}{'&' if '?' in redirect else '?'}{params}", status_code=302
-        )
+    return await paypal_order_return_handler(
+        redirect=redirect,
+        token=token,
+        PayerID=PayerID,
+    )
 
 
 @router.get("/paypal/cancel", summary="PayPal cancel URL")
@@ -410,223 +381,37 @@ async def paypal_cancel(
     redirect: str = Query(..., description="Original app redirect deep link"),
     token: Optional[str] = Query(None, description="PayPal order ID token"),
 ):
-    log_api_request(api_logger, "GET", "/paypal/cancel", {"token": token})
-    api_logger.info(f"🚫 PayPal payment cancelled: {token or 'no-token'}")
-
-    params = urlencode({"status": "cancel", "orderId": token or ""})
-    return RedirectResponse(
-        url=f"{redirect}{'&' if '?' in redirect else '?'}{params}", status_code=302
+    return await paypal_cancel_handler(
+        redirect=redirect,
+        token=token,
     )
 
 
+@router.post("/paypal/webhook/order")
+async def paypal_webhook_order(request: Request):
+    return await paypal_webhook_order_handler(request=request)
+
+
 # ===============================================================
-# SHIPPO API
+# SHIPPO ENDPOINT
 # ===============================================================
-
-shippo_sdk = shippo.Shippo(api_key_header=SHIPPO_API_KEY)
-
-
-shippo_sdk = shippo.Shippo(api_key_header=SHIPPO_API_KEY)
-
-
-@router.get("/shippo/rates", response_model=List[RateOption])
+@router.get("/shippo/rates", response_model=RateResponse)
 async def get_shipping_rates(
-    listing_id: str = Query(..., description="The eBay listing ID"),
-    seller_id: str = Query(..., description="The seller's user ID"),
-    buyer_id: str = Query(..., description="The buyer's user ID"),
-    insurance: Optional[bool] = Query(
-        False, description="Whether to include insurance"
-    ),
-    insurance_amount: Optional[float] = Query(0.0, description="Insurance amount"),
-    insurance_currency: Optional[str] = Query(
-        "GBP", description="Currency for insurance"
-    ),
+    seller_id: str,
+    buyer_id: str,
+    insurance: Optional[bool] = False,
+    insurance_currency: Optional[str] = None,
+    insurance_amount: Optional[float] = 0.0,
 ):
-    if not SHIPPO_API_KEY:
-        raise HTTPException(status_code=500, detail="SHIPPO_API_KEY not set")
-
-    api_logger.info(f"SHIPPO_ALLOWED_PROVIDERS: {SHIPPO_ALLOWED_PROVIDERS}")
-
-    # Fetch seller & buyer data
-    seller = (
-        supabase.table("profiles")
-        .select("username, phone_number")
-        .eq("id", seller_id)
-        .execute()
-        .data[0]
-    )
-    seller_addr = (
-        supabase.table("user_addresses")
-        .select(
-            "address_line_1, address_line_2, city, state_province, postal_code, country"
-        )
-        .eq("user_id", seller_id)
-        .execute()
-        .data[0]
+    return await shippo_rates_handler(
+        seller_id=seller_id,
+        buyer_id=buyer_id,
+        insurance=insurance,
+        insurance_currency=insurance_currency,
+        insurance_amount=insurance_amount,
     )
 
-    buyer = (
-        supabase.table("profiles")
-        .select("username, phone_number")
-        .eq("id", buyer_id)
-        .execute()
-        .data[0]
-    )
-    buyer_addr = (
-        supabase.table("user_addresses")
-        .select(
-            "address_line_1, address_line_2, city, state_province, postal_code, country"
-        )
-        .eq("user_id", buyer_id)
-        .execute()
-        .data[0]
-    )
 
-    # -------------------------
-    # Build Shippo address objects
-    # -------------------------
-    def build_address(user, addr):
-        street = addr["address_line_1"]
-        if addr.get("address_line_2"):
-            street = f"{street}, {addr['address_line_2']}"
-        return components.AddressCreateRequest(
-            name=user["username"],
-            street1=street,
-            city=addr["city"],
-            state=addr.get("state_province") or "",  # keep empty for UK
-            zip=addr["postal_code"],
-            country=addr["country"].upper(),
-        )
-
-    seller_address = build_address(seller, seller_addr)
-    buyer_address = build_address(buyer, buyer_addr)
-
-    # -------------------------
-    # Parcel
-    # -------------------------
-    parcel = components.ParcelCreateRequest(
-        length="20",
-        width="15",
-        height="2",
-        distance_unit=components.DistanceUnitEnum.CM,
-        weight="0.05",
-        mass_unit=components.WeightUnitEnum.KG,
-    )
-
-    # -------------------------
-    # Insurance
-    # -------------------------
-    shippo_insurance_amount = None
-    shippo_insurance_currency = None
-    if insurance and insurance_amount and insurance_amount > 0:
-        shippo_insurance_amount = f"{float(insurance_amount):.2f}"
-        shippo_insurance_currency = insurance_currency
-
-    # -------------------------
-    # Create shipment
-    # -------------------------
-    shipment_request = components.ShipmentCreateRequest(
-        address_from=seller_address,
-        address_to=buyer_address,
-        parcels=[parcel],
-        async_=False,
-        insurance_amount=shippo_insurance_amount,
-        insurance_currency=shippo_insurance_currency,
-    )
-
-    try:
-        shipment = shippo_sdk.shipments.create(shipment_request)
-    except Exception as e:
-        api_logger.error(f"Error creating shipment: {str(e)}")
-        log_error_with_context(api_logger, e, "creating shipment")
-        raise HTTPException(
-            status_code=500, detail=f"Error creating shipment: {str(e)}"
-        )
-
-    # Check if shipment has rates
-    if not shipment.rates:
-        api_logger.error(f"No rates found in shipment: {shipment}")
-        raise HTTPException(status_code=502, detail="No shipping rates available")
-
-    raw_rates = shipment.rates
-
-    # -------------------------
-    # Parse rates
-    # -------------------------
-    parsed: List[RateOption] = []
-    for r in raw_rates:
-        try:
-            print(r)
-            amount = float(r.amount)
-            parsed.append(
-                RateOption(
-                    id=r.object_id,
-                    value=str(amount),
-                    label=f"{r.provider} - {r.servicelevel.name}",
-                    courier=r.provider,
-                    service=r.servicelevel.name,
-                    amount=amount,
-                    currency=r.currency,
-                    estimated_days=r.estimated_days,
-                    shippo_rate_id=r.object_id,
-                )
-            )
-        except Exception as ex:
-            api_logger.debug("Skipping malformed rate: %s; error: %s", r, ex)
-
-    if SHIPPO_ALLOWED_PROVIDERS:
-        parsed = [p for p in parsed if p.courier in SHIPPO_ALLOWED_PROVIDERS]
-
-    parsed.sort(key=lambda x: x.amount)
-    if not parsed:
-        raise HTTPException(status_code=502, detail="No shipping rates available")
-
-    return parsed
-
-
-@router.post("/shippo/transactions", response_model=List[RateOption])
-async def user_submit_order(listing_id, buyer_id, selected_rate_id):
-
-    vw_chaamo_cards_response = supabase.table("vw_chaamo").select("*").eq("id", listing_id).execute()
-    vw_chaamo_card = vw_chaamo_cards_response.data[0]
-
-    order_payload = {
-        "listing_id": vw_chaamo_card["id"],
-        "user_card_id": vw_chaamo_card["user_card_id"],
-        "seller_id": vw_chaamo_card["seller_id"],
-        "buyer_id": buyer_id,
-        "final_price": "",
-        "shipping_fee": "",
-        "insurance_fee": "",
-        "platform_fee": "",
-        "seller_earnings": "",
-        "status": "",
-        "shipping_address": "", # json object
-        "rate_id": selected_rate_id,
-        "status": "pending_payment"
-    }
-
-    print(order_payload)
-
-    return order_payload
-
-    # Save the order to the database first
-    # order =  supabase.table("orders").insert(order_payload).execute()
-
-    # # Create Shippo Transaction
-    # transaction = create_shippo_transaction(
-    #     order["id"], selected_rate_id, user_email="user@example.com"
-    # )
-
-    # # Save transaction_id & payment_url to DB
-    # supabase.table("payments").insert(
-    #     {
-    #         "order_id": order["id"],
-    #         "transaction_id": transaction.object_id,
-    #         "payment_url": transaction.payment_url,
-    #         "status": transaction.status,
-    #     }
-    # ).execute()
-
-    # # Redirect user to PayPal
-    # return transaction.payment_url
+@router.post("/shippo/webhooks")
+async def shippo_webhook(request: Request):
+    return await shippo_webhook_handler(request=request)
