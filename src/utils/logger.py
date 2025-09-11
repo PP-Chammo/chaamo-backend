@@ -187,11 +187,6 @@ def log_database_operation(
     logger.info(f"💾 {operation} {count} records to {table}")
 
 
-def log_error_with_context(logger: logging.Logger, error: Exception, context: str):
-    """Log error with context in a beautiful format."""
-    logger.error(f"❌ {context}: {str(error)}")
-
-
 # Create module-level loggers
 api_logger = setup_logger("chaamo.api")
 worker_logger = setup_logger("chaamo.worker")

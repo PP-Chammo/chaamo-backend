@@ -1,7 +1,6 @@
 """Distributed scheduler for eBay scraping tasks with proper multi-instance coordination."""
 
 import asyncio
-import logging
 import uuid
 from datetime import datetime, timedelta
 from typing import List, Dict
@@ -13,6 +12,7 @@ from src.ebay_scraper import scraper
 from src.models.ebay import Region
 from src.models.category import CategoryId
 from src.utils.supabase import supabase
+from src.utils.logger import scheduler_logger
 
 
 # ==============================================================================
@@ -20,71 +20,76 @@ from src.utils.supabase import supabase
 # ==============================================================================
 
 
-def _setup_logging():
-    """Setup clean logging configuration."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-    return logging.getLogger(__name__)
-
-
 def _get_instance_id() -> str:
     """Get unique instance ID for this application instance."""
     import os
+
     # Use Fly.io instance ID if available, otherwise generate UUID
-    return os.environ.get('FLY_ALLOC_ID', str(uuid.uuid4()))
+    return os.environ.get("FLY_ALLOC_ID", str(uuid.uuid4()))
 
 
-async def _acquire_job_lock(job_name: str, instance_id: str, lock_duration_minutes: int = 30) -> bool:
+async def _acquire_job_lock(
+    job_name: str, instance_id: str, lock_duration_minutes: int = 30
+) -> bool:
     """Acquire distributed job lock to prevent duplicate execution across instances."""
     try:
         expires_at = datetime.utcnow() + timedelta(minutes=lock_duration_minutes)
-        
+
         # Try to insert new lock
-        result = supabase.table("scheduler_locks").insert({
-            "job_name": job_name,
-            "instance_id": instance_id,
-            "locked_at": datetime.utcnow().isoformat(),
-            "expires_at": expires_at.isoformat(),
-            "status": "active"
-        }).execute()
-        
+        result = (
+            supabase.table("scheduler_locks")
+            .insert(
+                {
+                    "job_name": job_name,
+                    "instance_id": instance_id,
+                    "locked_at": datetime.utcnow().isoformat(),
+                    "expires_at": expires_at.isoformat(),
+                    "status": "active",
+                }
+            )
+            .execute()
+        )
+
         if result.data:
             return True
-            
+
     except Exception as e:
         # Lock already exists or other error - check if we can take over expired lock
         try:
             # Clean up expired locks first
-            supabase.table("scheduler_locks").delete().match({
-                "job_name": job_name
-            }).filter("expires_at", "lt", datetime.utcnow().isoformat()).execute()
-            
+            supabase.table("scheduler_locks").delete().match(
+                {"job_name": job_name}
+            ).filter("expires_at", "lt", datetime.utcnow().isoformat()).execute()
+
             # Try to acquire again after cleanup
-            result = supabase.table("scheduler_locks").insert({
-                "job_name": job_name,
-                "instance_id": instance_id,
-                "locked_at": datetime.utcnow().isoformat(),
-                "expires_at": expires_at.isoformat(),
-                "status": "active"
-            }).execute()
-            
+            result = (
+                supabase.table("scheduler_locks")
+                .insert(
+                    {
+                        "job_name": job_name,
+                        "instance_id": instance_id,
+                        "locked_at": datetime.utcnow().isoformat(),
+                        "expires_at": expires_at.isoformat(),
+                        "status": "active",
+                    }
+                )
+                .execute()
+            )
+
             return bool(result.data)
-            
+
         except Exception:
             return False
-    
+
     return False
 
 
 async def _release_job_lock(job_name: str, instance_id: str) -> bool:
     """Release job lock after completion."""
     try:
-        supabase.table("scheduler_locks").delete().match({
-            "job_name": job_name,
-            "instance_id": instance_id
-        }).execute()
+        supabase.table("scheduler_locks").delete().match(
+            {"job_name": job_name, "instance_id": instance_id}
+        ).execute()
         return True
     except Exception:
         return False
@@ -203,23 +208,29 @@ class EbayScheduler:
     def __init__(self):
         self.scheduler = AsyncIOScheduler()
         self.is_running = False
-        self.logger = _setup_logging()
+        self.logger = scheduler_logger
         self.scrape_configs = _build_scrape_configs()
         self.instance_id = _get_instance_id()
 
     async def run_daily_scrape(self):
         """Execute daily scraping batch with distributed locking."""
         if self.is_running:
-            self.logger.warning("Daily scrape already running locally, skipping execution")
+            self.logger.warning(
+                "Daily scrape already running locally, skipping execution"
+            )
             return
 
         job_name = "daily_ebay_scrape"
-        
+
         # Try to acquire distributed lock
-        lock_acquired = await _acquire_job_lock(job_name, self.instance_id, lock_duration_minutes=60)
-        
+        lock_acquired = await _acquire_job_lock(
+            job_name, self.instance_id, lock_duration_minutes=60
+        )
+
         if not lock_acquired:
-            self.logger.info("🔒 Another instance is already running daily scrape, skipping")
+            self.logger.info(
+                "🔒 Another instance is already running daily scrape, skipping"
+            )
             return
 
         self.logger.info(f"🔑 Acquired job lock for instance {self.instance_id}")

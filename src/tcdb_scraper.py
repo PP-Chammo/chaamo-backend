@@ -4,10 +4,10 @@ from typing import Optional, List, Tuple, Any
 from src.models.category import CategoryId
 from src.models.tcdb import BrowseDropdown
 from src.utils.playwright import playwright_get_content
-from src.utils.logger import get_logger
+from src.utils.logger import scraper_logger
 from src.utils.scraper import _extract_year_range, upsert_card_sets, upsert_master_cards
 
-logger = get_logger("tcdb_scraper")
+logger = scraper_logger
 
 ignore_set_keywords = [
     "autograph",
@@ -300,9 +300,6 @@ async def tcdb_scrape_handler(
                 # iterate card pages; break when no rows found
                 for page_number in range(1, 30):
                     if card_set["name"] != set_last_name:
-                        print(
-                            "--------------------------------------------------------------------------------"
-                        )
                         logger.info(
                             f"[{browse_category}] Processing set \"{card_set['name']}\" - {set_last_number}/{len(upserted_sets)}"
                         )

@@ -16,19 +16,23 @@ except Exception:  # pragma: no cover
     Stealth = None
 
 try:
-    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+    from playwright.async_api import (
+        async_playwright,
+        TimeoutError as PlaywrightTimeoutError,
+    )
+
     _HAS_PLAYWRIGHT = True
 except Exception:  # pragma: no cover
     async_playwright = None
     PlaywrightTimeoutError = Exception
     _HAS_PLAYWRIGHT = False
 
-from src.utils.logger import get_logger
+from src.utils.logger import scraper_logger
 
 # Set this to True for debug (shows browser window), False for normal headless mode
 headless = True
 
-logger = get_logger("playwright")
+logger = scraper_logger
 
 # User agents and accept-languages
 USER_AGENTS = [
@@ -82,13 +86,13 @@ def is_playwright_installed() -> bool:
 
 def ensure_playwright_browsers():
     if _is_production():
-        print("🚫 Playwright disabled in production; skipping browser install")
+        logger.info("Playwright disabled in production; skipping browser install")
         return
     if not is_playwright_installed():
-        print("\U0001F680 Installing Playwright browsers (first run)...")
+        logger.info("Installing Playwright browsers (first run)...")
         subprocess.run(["playwright", "install", "chromium"], check=True)
     else:
-        print("\U0001F7E2 Playwright browsers already installed.")
+        logger.info("Playwright browsers already installed.")
 
 
 def get_random_headers() -> dict:
@@ -108,7 +112,9 @@ async def _ensure_browser():
     if _is_production():
         raise RuntimeError("Playwright is disabled in production environment")
     if not _HAS_PLAYWRIGHT:
-        raise RuntimeError("Playwright is not installed or unavailable in this environment")
+        raise RuntimeError(
+            "Playwright is not installed or unavailable in this environment"
+        )
     if _browser_obj:
         return
     _playwright_obj = await async_playwright().start()
@@ -163,7 +169,10 @@ async def playwright_get_content(
                 context = await _browser_obj.new_context(
                     user_agent=headers.get("User-Agent"),
                     locale=headers.get("Accept-Language", "en-US"),
-                    viewport={"width": random.randint(1200, 1920), "height": random.randint(900, 1080)},
+                    viewport={
+                        "width": random.randint(1200, 1920),
+                        "height": random.randint(900, 1080),
+                    },
                 )
                 try:
                     if Stealth is not None:
@@ -175,7 +184,11 @@ async def playwright_get_content(
 
                 page = await context.new_page()
                 # Set extra headers (except User-Agent/Accept-Language handled above)
-                extra_headers = {k: v for k, v in headers.items() if k not in ("User-Agent", "Accept-Language")}
+                extra_headers = {
+                    k: v
+                    for k, v in headers.items()
+                    if k not in ("User-Agent", "Accept-Language")
+                }
                 if extra_headers:
                     await context.set_extra_http_headers(extra_headers)
 

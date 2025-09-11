@@ -1,6 +1,5 @@
 from typing import Optional, List
 from datetime import datetime
-from dotenv import load_dotenv
 from fastapi import HTTPException, Request
 from shippo.models import components
 
@@ -8,11 +7,13 @@ from src.models.shippo import RateOption, RateResponse
 from src.utils.supabase import supabase
 from src.utils.logger import (
     api_logger,
-    log_error_with_context,
 )
-from src.utils.shippo import shippo_validate_address, shippo_sdk, shippo_is_test, SHIPPO_API_KEY
-
-load_dotenv()
+from src.utils.shippo import (
+    shippo_validate_address,
+    shippo_sdk,
+    shippo_is_test,
+    SHIPPO_API_KEY,
+)
 
 
 # ===============================================================
@@ -124,14 +125,20 @@ async def shippo_rates_handler(
         }
 
     try:
-        validated_seller = await shippo_validate_address(_raw_address_payload(seller, seller_addr))
-        validated_buyer = await shippo_validate_address(_raw_address_payload(buyer, buyer_addr))
+        validated_seller = await shippo_validate_address(
+            _raw_address_payload(seller, seller_addr)
+        )
+        validated_buyer = await shippo_validate_address(
+            _raw_address_payload(buyer, buyer_addr)
+        )
     except HTTPException:
         # Bubble up specific HTTP errors (auth, rate limits, validation, etc.)
         raise
     except Exception as e:
         api_logger.exception(f"Shippo address validation failed: {e}")
-        raise HTTPException(status_code=500, detail="Shipping address validation failed")
+        raise HTTPException(
+            status_code=500, detail="Shipping address validation failed"
+        )
 
     # Helper to safely extract fields from dict/object
     def _get_field(obj, field, default=None):
@@ -144,26 +151,40 @@ async def shippo_rates_handler(
 
     # Convert normalized results back into AddressCreateRequest for shipment creation
     seller_address = components.AddressCreateRequest(
-        name=_get_field(validated_seller, "name") or (seller.get("username") or "").strip(),
+        name=_get_field(validated_seller, "name")
+        or (seller.get("username") or "").strip(),
         email=_get_field(validated_seller, "email") or (seller.get("email") or ""),
-        phone=_get_field(validated_seller, "phone") or (seller.get("phone_number") or ""),
-        street1=_get_field(validated_seller, "street1") or (seller_addr.get("address_line_1") or "").strip(),
-        street2=_get_field(validated_seller, "street2") or (seller_addr.get("address_line_2") or "").strip() or None,
+        phone=_get_field(validated_seller, "phone")
+        or (seller.get("phone_number") or ""),
+        street1=_get_field(validated_seller, "street1")
+        or (seller_addr.get("address_line_1") or "").strip(),
+        street2=_get_field(validated_seller, "street2")
+        or (seller_addr.get("address_line_2") or "").strip()
+        or None,
         city=_get_field(validated_seller, "city") or (seller_addr.get("city") or ""),
-        state=_get_field(validated_seller, "state") or (seller_addr.get("state_province") or ""),
-        zip=_get_field(validated_seller, "zip") or (seller_addr.get("postal_code") or ""),
-        country=_get_field(validated_seller, "country") or (seller_addr.get("country") or "").upper(),
+        state=_get_field(validated_seller, "state")
+        or (seller_addr.get("state_province") or ""),
+        zip=_get_field(validated_seller, "zip")
+        or (seller_addr.get("postal_code") or ""),
+        country=_get_field(validated_seller, "country")
+        or (seller_addr.get("country") or "").upper(),
     )
     buyer_address = components.AddressCreateRequest(
-        name=_get_field(validated_buyer, "name") or (buyer.get("username") or "").strip(),
+        name=_get_field(validated_buyer, "name")
+        or (buyer.get("username") or "").strip(),
         email=_get_field(validated_buyer, "email") or (buyer.get("email") or ""),
         phone=_get_field(validated_buyer, "phone") or (buyer.get("phone_number") or ""),
-        street1=_get_field(validated_buyer, "street1") or (buyer_addr.get("address_line_1") or "").strip(),
-        street2=_get_field(validated_buyer, "street2") or (buyer_addr.get("address_line_2") or "").strip() or None,
+        street1=_get_field(validated_buyer, "street1")
+        or (buyer_addr.get("address_line_1") or "").strip(),
+        street2=_get_field(validated_buyer, "street2")
+        or (buyer_addr.get("address_line_2") or "").strip()
+        or None,
         city=_get_field(validated_buyer, "city") or (buyer_addr.get("city") or ""),
-        state=_get_field(validated_buyer, "state") or (buyer_addr.get("state_province") or ""),
+        state=_get_field(validated_buyer, "state")
+        or (buyer_addr.get("state_province") or ""),
         zip=_get_field(validated_buyer, "zip") or (buyer_addr.get("postal_code") or ""),
-        country=_get_field(validated_buyer, "country") or (buyer_addr.get("country") or "").upper(),
+        country=_get_field(validated_buyer, "country")
+        or (buyer_addr.get("country") or "").upper(),
     )
 
     # -------------------------
@@ -344,7 +365,7 @@ async def shippo_rates_handler(
 # ===============================================================
 async def shippo_webhook_handler(request: Request):
     body = await request.json()
-    print("Shippo webhook received:", body)
+    api_logger.info("Shippo webhook received: %s", body)
     if body.get("event") == "transaction.updated":
         data = body.get("data", {})
         if data.get("status") == "SUCCESS":

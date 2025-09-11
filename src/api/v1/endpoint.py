@@ -28,7 +28,6 @@ from src.utils.logger import (
     api_logger,
     log_api_request,
     log_worker_task,
-    log_error_with_context,
 )
 
 router = APIRouter()
@@ -165,12 +164,7 @@ async def start_scrape_worker(
         )
 
     except Exception as e:
-        api_logger.error(f"❌ Worker creation failed: {str(e)}")
-        api_logger.error(f"❌ Exception type: {type(e).__name__}")
-        import traceback
-
-        api_logger.error(f"❌ Traceback: {traceback.format_exc()}")
-        log_error_with_context(api_logger, e, "starting worker")
+        api_logger.exception("Error starting worker: %s", e)
         raise HTTPException(status_code=500, detail=f"Failed to start worker: {str(e)}")
 
 
@@ -217,7 +211,9 @@ async def start_scrape_worker_get(
 # ===============================================================
 
 
-@router.post("/tcdb_scrape", summary="Start TCDB scraping - THIS ENDPOINT DISABLED ON PRODUCTION")
+@router.post(
+    "/tcdb_scrape", summary="Start TCDB scraping - THIS ENDPOINT DISABLED ON PRODUCTION"
+)
 async def start_tcdb_scrape(
     category_id: CategoryDropdown = Query(
         CategoryDropdown.TOPPS, description="Filter by brand category"
@@ -232,7 +228,9 @@ async def start_tcdb_scrape(
     """Start a TCDB scraping task based on a brand and optional browse category."""
     env = (os.environ.get("ENV") or os.environ.get("APP_ENV") or "development").lower()
     if env == "production":
-        raise HTTPException(status_code=403, detail="TCDB scraping is disabled in production")
+        raise HTTPException(
+            status_code=403, detail="TCDB scraping is disabled in production"
+        )
     cat_id = CategoryDropdown.to_category_id(category_id)
     log_api_request(
         api_logger,
@@ -284,7 +282,7 @@ async def get_all_workers(manager=Depends(get_worker_manager)):
             tasks=[WorkerTaskResponse(**task.to_dict()) for task in tasks],
         )
     except Exception as e:
-        log_error_with_context(api_logger, e, "fetching workers")
+        api_logger.exception("Error fetching workers: %s", e)
         raise HTTPException(status_code=500, detail=f"Error fetching workers: {str(e)}")
 
 
@@ -312,7 +310,7 @@ async def get_worker_status(task_id: str, manager=Depends(get_worker_manager)):
     except HTTPException:
         raise
     except Exception as e:
-        log_error_with_context(api_logger, e, f"fetching task {task_id[:8]}...")
+        api_logger.exception("Error fetching task %s...: %s", task_id[:8], e)
         raise HTTPException(status_code=500, detail=f"Error fetching task: {str(e)}")
 
 
@@ -380,6 +378,11 @@ async def paypal_return(
     )
 
 
+@router.post("/paypal/webhook/order")
+async def paypal_webhook_order(request: Request):
+    return await paypal_webhook_order_handler(request=request)
+
+
 @router.get("/paypal/cancel", summary="PayPal cancel URL")
 async def paypal_cancel(
     redirect: str = Query(..., description="Original app redirect deep link"),
@@ -389,11 +392,6 @@ async def paypal_cancel(
         redirect=redirect,
         token=token,
     )
-
-
-@router.post("/paypal/webhook/order")
-async def paypal_webhook_order(request: Request):
-    return await paypal_webhook_order_handler(request=request)
 
 
 # ===============================================================

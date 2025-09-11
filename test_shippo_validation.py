@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 from utils.shippo import shippo_validate_address
 from utils.logger import api_logger
 
-async def test_broadway_address():
+async def _test_broadway_address_async():
     """Test the specific Broadway 1 address that was causing issues"""
     
     # The problematic address from the checkpoint
@@ -55,7 +55,7 @@ async def test_broadway_address():
         
     print("\n" + "="*50)
 
-async def test_similar_addresses():
+async def _test_similar_addresses_async():
     """Test multiple similar addresses to verify duplicate handling"""
     
     addresses = [
@@ -117,6 +117,14 @@ async def main():
     await test_similar_addresses()
     
     print("\nTest suite completed!")
+
+def test_broadway_address():
+    asyncio.run(_test_broadway_address_async())
+
+
+def test_similar_addresses():
+    asyncio.run(_test_similar_addresses_async())
+
 
 if __name__ == "__main__":
     asyncio.run(main())

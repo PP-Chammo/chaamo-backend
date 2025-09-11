@@ -4,12 +4,26 @@ import httpx
 from decimal import Decimal
 from fastapi import HTTPException, Request
 from typing import Optional, Tuple, Dict, Any
-from src.utils.logger import (
-    api_logger,
-    log_error_with_context,
-)
+from src.utils.logger import api_logger
+from src.utils.supabase import supabase
 
 PAYPAL_ENV = "sandbox"
+
+
+# ===============================================================
+# Environment helpers
+# ===============================================================
+def paypal_get_client_id() -> Optional[str]:
+    return os.getenv("PAYPAL_CLIENT_ID")
+
+
+def paypal_get_client_secret() -> Optional[str]:
+    return os.getenv("PAYPAL_SECRET")
+
+
+def paypal_get_env() -> str:
+    return (os.getenv("PAYPAL_ENV") or PAYPAL_ENV).lower()
+
 
 def get_base_url(request: Request) -> str:
     # e.g. https://chaamo-backend.fly.dev
@@ -17,21 +31,22 @@ def get_base_url(request: Request) -> str:
 
 
 def get_api_base() -> str:
+    env = paypal_get_env()
     return (
         "https://api-m.paypal.com"
-        if PAYPAL_ENV == "live"
+        if env == "live"
         else "https://api-m.sandbox.paypal.com"
     )
 
 
 def get_credentials() -> Tuple[str, str]:
-    client_id: Optional[str] = os.environ.get("PAYPAL_CLIENT_ID")
-    secret: Optional[str] = os.environ.get("PAYPAL_SECRET")
+    client_id: Optional[str] = paypal_get_client_id()
+    secret: Optional[str] = paypal_get_client_secret()
 
     api_logger.info(
         f"PayPal credentials check - Client ID present: {bool(client_id)}, Secret present: {bool(secret)}"
     )
-    api_logger.info(f"PayPal environment: {PAYPAL_ENV}")
+    api_logger.info(f"PayPal environment: {paypal_get_env()}")
     api_logger.info(f"PayPal API base: {get_api_base()}")
 
     if not client_id or not secret:
@@ -137,7 +152,7 @@ async def paypal_create_subscription(
             "request_id": request_id,
         }
     except Exception as e:
-        log_error_with_context(api_logger, e, "PayPal subscription create")
+        api_logger.exception("PayPal subscription create failed: %s", e)
         # bubble up meaningful HTTPException if desired by caller
         raise HTTPException(
             status_code=500, detail=f"Failed creating PayPal subscription: {e}"
@@ -364,7 +379,7 @@ async def paypal_capture_authorization(
 # ===============================================================
 async def paypal_void_checkout(order_id: str) -> bool:
     """
-    Backwards-compatible wrapper: if your orders table stores shipping_authorization_id
+    Backwards-compatible wrapper: if your orders table stores gateway_authorization_id
     (or similar) use it; otherwise this will attempt to call /v2/checkout/orders/{id}/authorize
     to get an authorization and then void it (safe approach).
     NOTE: if you never authorized the order, there may be nothing to void.
@@ -373,13 +388,13 @@ async def paypal_void_checkout(order_id: str) -> bool:
     try:
         order_resp = (
             supabase.table("orders")
-            .select("id, shipping_authorization_id")
+            .select("id, gateway_authorization_id")
             .eq("gateway_order_id", order_id)
             .execute()
         )
         if order_resp.data and len(order_resp.data) > 0:
             order = order_resp.data[0]
-            auth_id = order.get("shipping_authorization_id") or order.get(
+            auth_id = order.get("gateway_authorization_id") or order.get(
                 "authorization_id"
             )
             if auth_id:

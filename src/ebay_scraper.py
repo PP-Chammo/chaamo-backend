@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from dataclasses import dataclass
 
-from src.utils.logger import get_logger
+from src.utils.logger import scraper_logger
 from src.models.category import CategoryId
 from src.models.ebay import Region
 from src.utils.supabase import supabase
@@ -18,7 +18,7 @@ from src.utils.scraper import (
     update_user_card,
 )
 
-scraper_logger = get_logger("scraper")
+# use global scraper_logger from utils.logger
 
 
 # --------------------------

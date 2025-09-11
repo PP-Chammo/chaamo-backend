@@ -11,13 +11,13 @@ import pytz
 from bs4 import BeautifulSoup
 import httpx
 
-from src.utils.logger import get_logger
+from src.utils.logger import scraper_logger
 from src.models.category import CategoryId
 from src.models.ebay import Region, base_target_url
 from src.utils.httpx import httpx_get_content
 from src.utils.supabase import supabase
 
-scraper_logger = get_logger("scraper")
+# use global scraper_logger
 
 try:
     from rapidfuzz import process, fuzz  # type: ignore
@@ -144,9 +144,7 @@ def _normalize_text(s: str) -> str:
 # ===============================================================
 
 
-def _fuzzy_best_match(
-    candidate: str, choices: list[str]
-) -> tuple[str | None, float]:
+def _fuzzy_best_match(candidate: str, choices: list[str]) -> tuple[str | None, float]:
     if not candidate or not choices:
         return None, 0.0
     if _HAS_RAPIDFUZZ:
@@ -324,7 +322,7 @@ def normalize_card_title(
     # If no direct match, try fuzzy matching with lower threshold
     if not found_set:
         best_name, score = _fuzzy_best_match(norm, set_names)
-        if best_name and score >= fuzzy_threshold:  
+        if best_name and score >= fuzzy_threshold:
             found_set = best_name
             set_score = score / 100.0
             norm = norm.replace(best_name.lower(), "")
@@ -842,31 +840,38 @@ async def select_best_ebay_post(
     # scraper_logger.info(f"🔍 Extracted user attributes: {user_attrs}")
 
     # Extract exact match criteria from user_attrs
-    user_year = user_attrs.get('year')
-    user_set = user_attrs.get('set')
-    user_player = user_attrs.get('player_or_character')
+    user_year = user_attrs.get("year")
+    user_set = user_attrs.get("set")
+    user_player = user_attrs.get("player_or_character")
 
     # Filter posts that match exactly on year, set, and player (if they are specified)
     filtered_posts = []
     for post in posts:
         post_attrs = post.get("metadata", {}).get("normalized_attributes", {})
         # Check year
-        if user_year is not None and post_attrs.get('year') != user_year:
+        if user_year is not None and post_attrs.get("year") != user_year:
             continue
         # Check set
-        if user_set is not None and post_attrs.get('set') != user_set:
+        if user_set is not None and post_attrs.get("set") != user_set:
             continue
         # Check player/character
-        if user_player is not None and post_attrs.get('player_or_character') != user_player:
+        if (
+            user_player is not None
+            and post_attrs.get("player_or_character") != user_player
+        ):
             continue
         filtered_posts.append(post)
 
     # If no posts match the exact criteria, fall back to all posts
     if not filtered_posts:
-        scraper_logger.info("No exact matches found for year, set, and player. Falling back to all posts.")
+        scraper_logger.info(
+            "No exact matches found for year, set, and player. Falling back to all posts."
+        )
         filtered_posts = posts
     else:
-        scraper_logger.info(f"Filtered to {len(filtered_posts)} posts with exact matches for year, set, and player.")
+        scraper_logger.info(
+            f"Filtered to {len(filtered_posts)} posts with exact matches for year, set, and player."
+        )
 
     # Limit posts to prevent timeout (take first 100 for efficiency)
     if len(filtered_posts) > 100:
@@ -1215,9 +1220,13 @@ async def upsert_card_sets(card_sets: list[dict[str, any]]) -> dict[str, any]:
         BATCH = 500
         for i in range(0, len(db_records), BATCH):
             batch = db_records[i : i + BATCH]
-            resp = supabase.table("card_sets").upsert(
-                batch, on_conflict="platform_set_id", returning="representation"
-            ).execute()
+            resp = (
+                supabase.table("card_sets")
+                .upsert(
+                    batch, on_conflict="platform_set_id", returning="representation"
+                )
+                .execute()
+            )
             batch_records = resp.data or []
             results["records"].extend(batch_records)
             results["count"] += len(batch_records)
@@ -1265,9 +1274,13 @@ async def upsert_master_cards(cards: list[dict[str, any]]) -> dict[str, any]:
         BATCH = 500
         for i in range(0, len(db_records), BATCH):
             batch = db_records[i : i + BATCH]
-            resp = supabase.table("master_cards").upsert(
-                batch, on_conflict="platform_card_id", returning="representation"
-            ).execute()
+            resp = (
+                supabase.table("master_cards")
+                .upsert(
+                    batch, on_conflict="platform_card_id", returning="representation"
+                )
+                .execute()
+            )
             batch_records = resp.data or []
             results["records"].extend(batch_records)
             results["count"] += len(batch_records)
