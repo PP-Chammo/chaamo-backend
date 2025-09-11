@@ -30,6 +30,13 @@ def get_api_base() -> str:
 def get_credentials() -> Tuple[str, str]:
     client_id: Optional[str] = os.environ.get("PAYPAL_CLIENT_ID")
     secret: Optional[str] = os.environ.get("PAYPAL_SECRET")
+
+    api_logger.info(
+        f"PayPal credentials check - Client ID present: {bool(client_id)}, Secret present: {bool(secret)}"
+    )
+    api_logger.info(f"PayPal environment: {PAYPAL_ENV}")
+    api_logger.info(f"PayPal API base: {get_api_base()}")
+
     if not client_id or not secret:
         raise ValueError("PAYPAL_CLIENT_ID and PAYPAL_SECRET are required")
     return client_id, secret
@@ -158,8 +165,13 @@ async def paypal_create_order(
     Create PayPal order with intent=AUTHORIZE (so we can authorize -> void/capture later).
     Returns dict { "paypal_order_id": <id>, "paypal_checkout_url": <approval_url>, "raw": <resp.json()> }
     """
-    token = await get_access_token()
-    url = f"{get_api_base().rstrip('/')}/v2/checkout/orders"
+    try:
+        token = await get_access_token()
+        url = f"{get_api_base().rstrip('/')}/v2/checkout/orders"
+        api_logger.info(f"Creating PayPal order: {amount} {currency} at {url}")
+    except Exception as e:
+        api_logger.error(f"Failed to get PayPal access token: {e}")
+        raise
     payload = {
         "intent": "AUTHORIZE",
         "purchase_units": [
@@ -198,7 +210,11 @@ async def paypal_create_order(
             pu["items"] = items
     except Exception:
         # non-fatal: keep minimal payload if enrichment fails
-        api_logger.exception("Failed to enrich PayPal purchase unit; using minimal payload")
+        api_logger.exception(
+            "Failed to enrich PayPal purchase unit; using minimal payload"
+        )
+
+    api_logger.debug(f"PayPal order payload: {payload}")
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.post(
             url,
@@ -208,14 +224,33 @@ async def paypal_create_order(
             },
             json=payload,
         )
-    resp.raise_for_status()
+
+    api_logger.info(f"PayPal order creation response: {resp.status_code}")
+
+    if resp.status_code >= 400:
+        try:
+            error_data = resp.json()
+            api_logger.error(f"PayPal order creation failed: {error_data}")
+        except Exception:
+            api_logger.error(f"PayPal order creation failed: {resp.text}")
+        resp.raise_for_status()
+
     data = resp.json()
+    api_logger.debug(f"PayPal order creation success: {data}")
+
     # Find approve/checkout link
     approve_link = None
     for l in data.get("links", []) or []:
         if l.get("rel") == "approve":
             approve_link = l.get("href")
             break
+
+    if not approve_link:
+        api_logger.error(f"No approval link found in PayPal response: {data}")
+        raise HTTPException(
+            status_code=500, detail="PayPal order created but no approval link found"
+        )
+
     return {
         "paypal_order_id": data.get("id"),
         "paypal_checkout_url": approve_link,

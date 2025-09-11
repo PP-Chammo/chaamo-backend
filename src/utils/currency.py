@@ -58,7 +58,7 @@ def _fetch_rates() -> Optional[Dict[str, Decimal]]:
 
 
 def format_price(
-    from_currency: str, amount: float, to_currency: str
+    from_currency: str, to_currency: str, amount: float
 ) -> Optional[float]:
     """
     Convert `amount` from `from_currency` to `to_currency` using USD as base.

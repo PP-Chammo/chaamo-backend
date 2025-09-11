@@ -1,6 +1,6 @@
 import os
 import shippo
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import HTTPException, Request
