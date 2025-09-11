@@ -1,9 +1,7 @@
-import base64
 import os
 from typing import Optional, Tuple
 
 import httpx
-
 
 PAYPAL_ENV = os.environ.get("PAYPAL_ENV", "sandbox").lower()
 
@@ -107,3 +105,100 @@ async def capture_order(order_id: str) -> dict:
         )
         resp.raise_for_status()
         return resp.json()
+
+
+# -----------------------------
+# PayPal Subscription Functions
+# -----------------------------
+
+
+async def create_subscription(
+    paypal_plan_id: str,
+    return_url: str,
+    cancel_url: str,
+    subscriber_name: str = "Subscriber",
+    subscriber_email: str = "subscriber@example.com",
+    user_id: str = "",
+) -> dict:
+    """Create a PayPal subscription."""
+    token = await get_access_token()
+    url = f"{_api_base()}/v1/billing/subscriptions"
+
+    payload = {
+        "plan_id": paypal_plan_id,
+        "start_time": None,  # Start immediately
+        "subscriber": {
+            "name": {
+                "given_name": subscriber_name.split()[0],
+                "surname": subscriber_name.split()[-1],
+            },
+            "email_address": subscriber_email,
+        },
+        "application_context": {
+            "brand_name": "Chaamo",
+            "user_action": "SUBSCRIBE_NOW",
+            "payment_method": {
+                "payer_selected": "PAYPAL",
+                "payee_preferred": "IMMEDIATE_PAYMENT_REQUIRED",
+            },
+            "shipping_preference": "NO_SHIPPING",
+            "return_url": return_url,
+            "cancel_url": cancel_url,
+        },
+        "description": "Gold Membership - Monthly subscription for trading card marketplace",
+        "custom_id": user_id,
+        "locale": "en_US",
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json=payload,
+        )
+
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def get_subscription_details(subscription_id: str) -> dict:
+    """Get PayPal subscription details."""
+    token = await get_access_token()
+    url = f"{_api_base()}/v1/billing/subscriptions/{subscription_id}"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def cancel_subscription(
+    subscription_id: str, reason: str = "User requested cancellation"
+) -> dict:
+    """Cancel a PayPal subscription."""
+    token = await get_access_token()
+    url = f"{_api_base()}/v1/billing/subscriptions/{subscription_id}/cancel"
+
+    payload = {"reason": reason}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        resp.raise_for_status()
+        return resp.json() if resp.content else {"status": "cancelled"}
