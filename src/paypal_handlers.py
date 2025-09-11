@@ -8,15 +8,13 @@ from fastapi import HTTPException, Request
 from starlette.responses import RedirectResponse
 from decimal import Decimal, InvalidOperation
 
-from src.shippo_handlers import shippo_sdk
+from src.utils.shippo import shippo_sdk
 from src.models.shippo import TransactionPayload
 from src.utils.supabase import supabase
 from src.utils.currency import format_price
 from src.utils.shippo import (
     shippo_get_rate_details,
-    shippo_suggestion_format,
     shippo_validate_address,
-    MultipleAddressesException,
 )
 from src.utils.paypal import (
     get_access_token,
@@ -525,36 +523,8 @@ async def paypal_order_handler(request: Request, payload: "TransactionPayload"):
         # Validate address with Shippo
         try:
             validated_address = await shippo_validate_address(shipping_address)
-        except MultipleAddressesException as e:
-            # Shippo found multiple address matches but doesn't provide suggestions
-            # Guide user to provide more specific address details
-            api_logger.info(
-                "Shippo returned multiple address matches for buyer %s - asking for more specific details",
-                buyer_id,
-            )
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": "Address validation failed",
-                    "message": "Your address matched multiple records. Please provide more specific details.",
-                    "suggestions": [
-                        "Add apartment/suite number if applicable",
-                        "Double-check street name spelling", 
-                        "Verify city and state/province",
-                        "Ensure postal/ZIP code is complete and correct"
-                    ],
-                    "address_provided": {
-                        "street1": shipping_address.get("street1"),
-                        "street2": shipping_address.get("street2"),
-                        "city": shipping_address.get("city"),
-                        "state": shipping_address.get("state"),
-                        "zip": shipping_address.get("zip"),
-                        "country": shipping_address.get("country")
-                    }
-                },
-            )
         except HTTPException:
-            # Re-raise HTTP exceptions (including those from MultipleAddressesException handling above)
+            # Re-raise HTTP exceptions from address validation
             raise
         except Exception as e:
             # Log and handle other validation failures
@@ -939,11 +909,6 @@ async def paypal_order_return_handler(
         sep = "&" if "?" in final_redirect else "?"
         target_url = f"{final_redirect}{sep}{urlencode(return_params)}"
 
-        api_logger.info(
-            "Redirecting user to %s after PayPal return (merged params: %s)",
-            target_url,
-            merged,
-        )
         return RedirectResponse(url=target_url, status_code=302)
     except Exception as e:
         log_error_with_context(api_logger, e, "returning PayPal order (robust handler)")
@@ -988,7 +953,7 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                 order_resp = (
                     supabase.table("orders")
                     .select(
-                        "id, buyer_id, shipping_rate_id, shipping_transaction_id, final_price, currency, status"
+                        "id, buyer_id, shipping_rate_id, shipping_transaction_id, final_price, currency, status, shipping_address"
                     )
                     .eq("gateway_order_id", paypal_order_id)
                     .execute()
@@ -1062,12 +1027,20 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                 # Create transaction with the address
                 transaction = shippo_sdk.transactions.create(
                     components.TransactionCreateRequest(
-                        rate=order["shipping_rate_id"],
+                        rate=order.get("shipping_rate_id"),
                         label_file_type="PDF",
                         async_=False,
-                        metadata={"order_id": order_id, "buyer_id": order["buyer_id"]},
+                        metadata=f"order:{order_id} buyer:{order.get('buyer_id')}",
                     )
                 )
+
+                print(f"transaction: {transaction}")
+
+                if not transaction.object_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Create shippo transaction failed: {transaction}",
+                    )
 
                 # Check transaction status
                 tx_status = getattr(transaction, "status", "")
@@ -1098,7 +1071,10 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                         detail="The shipping address could not be verified. Please check the address and try again.",
                     )
                 # Handle multiple address matches consistently with main handler
-                elif "multiple records" in error_msg.lower() or "multiple addresses" in error_msg.lower():
+                elif (
+                    "multiple records" in error_msg.lower()
+                    or "multiple addresses" in error_msg.lower()
+                ):
                     raise HTTPException(
                         status_code=400,
                         detail={
@@ -1106,10 +1082,10 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                             "message": "Shipping address matched multiple records. Please provide more specific details.",
                             "suggestions": [
                                 "Add apartment/suite number if applicable",
-                                "Double-check street name spelling", 
+                                "Double-check street name spelling",
                                 "Verify city and state/province",
-                                "Ensure postal/ZIP code is complete and correct"
-                            ]
+                                "Ensure postal/ZIP code is complete and correct",
+                            ],
                         },
                     )
 

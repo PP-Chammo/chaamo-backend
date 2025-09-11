@@ -1,4 +1,3 @@
-# src/utils/playwright.py
 import asyncio
 import random
 import subprocess
@@ -6,10 +5,24 @@ import os
 from typing import Optional
 from urllib.parse import urlencode
 
-import playwright_stealth
-from playwright_stealth import stealth as Stealth
+# src/utils/playwright.py
 
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+# Optional imports; guard if Playwright not installed
+try:
+    import playwright_stealth
+    from playwright_stealth import stealth as Stealth
+except Exception:  # pragma: no cover
+    playwright_stealth = None
+    Stealth = None
+
+try:
+    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+    _HAS_PLAYWRIGHT = True
+except Exception:  # pragma: no cover
+    async_playwright = None
+    PlaywrightTimeoutError = Exception
+    _HAS_PLAYWRIGHT = False
+
 from src.utils.logger import get_logger
 
 # Set this to True for debug (shows browser window), False for normal headless mode
@@ -49,6 +62,11 @@ _browser_obj = None
 _PAGE_SEMAPHORE = asyncio.Semaphore(4)
 
 
+def _is_production() -> bool:
+    env = (os.environ.get("ENV") or os.environ.get("APP_ENV") or "development").lower()
+    return env == "production"
+
+
 def is_playwright_installed() -> bool:
     # Chromium browser path detection (platform independent)
     try:
@@ -63,6 +81,9 @@ def is_playwright_installed() -> bool:
 
 
 def ensure_playwright_browsers():
+    if _is_production():
+        print("🚫 Playwright disabled in production; skipping browser install")
+        return
     if not is_playwright_installed():
         print("\U0001F680 Installing Playwright browsers (first run)...")
         subprocess.run(["playwright", "install", "chromium"], check=True)
@@ -84,6 +105,10 @@ async def _ensure_browser():
     We create a new context per-request to allow varying user-agent / locale per request.
     """
     global _playwright_obj, _browser_obj
+    if _is_production():
+        raise RuntimeError("Playwright is disabled in production environment")
+    if not _HAS_PLAYWRIGHT:
+        raise RuntimeError("Playwright is not installed or unavailable in this environment")
     if _browser_obj:
         return
     _playwright_obj = await async_playwright().start()
@@ -103,8 +128,11 @@ async def playwright_get_content(
 ) -> str:
     """
     Fetch page content using playwright. Reuses browser process, creates a new context per request.
+    We create a new context per-request to allow varying user-agent / locale per request.
     Returns HTML content string or raises last exception if all attempts fail.
     """
+    if _is_production():
+        raise RuntimeError("Playwright content fetch is disabled in production")
     if params is None:
         params = {}
     if headers is None:
@@ -138,8 +166,9 @@ async def playwright_get_content(
                     viewport={"width": random.randint(1200, 1920), "height": random.randint(900, 1080)},
                 )
                 try:
-                    stealth = Stealth()
-                    await stealth.apply_stealth_async(context)
+                    if Stealth is not None:
+                        stealth = Stealth()
+                        await stealth.apply_stealth_async(context)
                 except Exception:
                     # stealth may fail sometimes; continue but log
                     logger.debug("stealth_async failed or skipped")

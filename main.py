@@ -1,6 +1,8 @@
 from contextlib import asynccontextmanager
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 from src.api.v1 import router as v1_endpoint
 from src.scheduler import start_ebay_cronjob, stop_ebay_cronjob
 from src.utils.playwright import ensure_playwright_browsers
@@ -8,8 +10,15 @@ from src.utils.playwright import ensure_playwright_browsers
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Load environment variables
+    load_dotenv()
+    env = (os.environ.get("ENV") or os.environ.get("APP_ENV") or "development").lower()
+
     # Startup
-    ensure_playwright_browsers()
+    if env != "production":
+        ensure_playwright_browsers()
+    else:
+        print("🚫 Skipping Playwright setup in production environment")
     print("🕐 Starting eBay cronjob scheduler...")
     start_ebay_cronjob()
     yield

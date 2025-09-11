@@ -1,5 +1,3 @@
-import os
-import shippo
 from typing import Optional, List
 from datetime import datetime
 from dotenv import load_dotenv
@@ -12,13 +10,9 @@ from src.utils.logger import (
     api_logger,
     log_error_with_context,
 )
+from src.utils.shippo import shippo_validate_address, shippo_sdk, shippo_is_test, SHIPPO_API_KEY
 
 load_dotenv()
-
-SHIPPO_API_KEY = os.environ.get("SHIPPO_API_KEY")
-
-shippo_is_test = True if "test" in SHIPPO_API_KEY else False
-shippo_sdk = shippo.Shippo(api_key_header=SHIPPO_API_KEY)
 
 
 # ===============================================================
@@ -114,27 +108,63 @@ async def shippo_rates_handler(
         raise HTTPException(status_code=500, detail="Buyer address lookup failed")
 
     # -------------------------
-    # Build Shippo address objects (robust to missing fields)
+    # Build, validate and normalize addresses via Shippo helper
     # -------------------------
-    def build_address(user, addr):
-        # Compose street1 with optional line2
-        street = (addr.get("address_line_1") or "").strip()
-        if addr.get("address_line_2"):
-            street = f"{street}, {addr['address_line_2'].strip()}"
-        return components.AddressCreateRequest(
-            name=(user.get("username") or "").strip(),
-            email=user.get("email") or "",
-            phone=user.get("phone_number") or "",
-            street1=street,
-            city=addr.get("city") or "",
-            state=addr.get("state_province")
-            or "",  # keep empty for countries without states
-            zip=addr.get("postal_code") or "",
-            country=(addr.get("country") or "").upper(),
-        )
+    def _raw_address_payload(user, addr):
+        return {
+            "name": (user.get("username") or "").strip(),
+            "email": user.get("email") or None,
+            "phone": user.get("phone_number") or None,
+            "street1": (addr.get("address_line_1") or "").strip(),
+            "street2": (addr.get("address_line_2") or "").strip() or "",
+            "city": addr.get("city") or "",
+            "state": addr.get("state_province") or "",
+            "zip": addr.get("postal_code") or "",
+            "country": (addr.get("country") or "").upper(),
+        }
 
-    seller_address = build_address(seller, seller_addr)
-    buyer_address = build_address(buyer, buyer_addr)
+    try:
+        validated_seller = await shippo_validate_address(_raw_address_payload(seller, seller_addr))
+        validated_buyer = await shippo_validate_address(_raw_address_payload(buyer, buyer_addr))
+    except HTTPException:
+        # Bubble up specific HTTP errors (auth, rate limits, validation, etc.)
+        raise
+    except Exception as e:
+        api_logger.exception(f"Shippo address validation failed: {e}")
+        raise HTTPException(status_code=500, detail="Shipping address validation failed")
+
+    # Helper to safely extract fields from dict/object
+    def _get_field(obj, field, default=None):
+        try:
+            if isinstance(obj, dict):
+                return obj.get(field, default)
+            return getattr(obj, field, default)
+        except Exception:
+            return default
+
+    # Convert normalized results back into AddressCreateRequest for shipment creation
+    seller_address = components.AddressCreateRequest(
+        name=_get_field(validated_seller, "name") or (seller.get("username") or "").strip(),
+        email=_get_field(validated_seller, "email") or (seller.get("email") or ""),
+        phone=_get_field(validated_seller, "phone") or (seller.get("phone_number") or ""),
+        street1=_get_field(validated_seller, "street1") or (seller_addr.get("address_line_1") or "").strip(),
+        street2=_get_field(validated_seller, "street2") or (seller_addr.get("address_line_2") or "").strip() or None,
+        city=_get_field(validated_seller, "city") or (seller_addr.get("city") or ""),
+        state=_get_field(validated_seller, "state") or (seller_addr.get("state_province") or ""),
+        zip=_get_field(validated_seller, "zip") or (seller_addr.get("postal_code") or ""),
+        country=_get_field(validated_seller, "country") or (seller_addr.get("country") or "").upper(),
+    )
+    buyer_address = components.AddressCreateRequest(
+        name=_get_field(validated_buyer, "name") or (buyer.get("username") or "").strip(),
+        email=_get_field(validated_buyer, "email") or (buyer.get("email") or ""),
+        phone=_get_field(validated_buyer, "phone") or (buyer.get("phone_number") or ""),
+        street1=_get_field(validated_buyer, "street1") or (buyer_addr.get("address_line_1") or "").strip(),
+        street2=_get_field(validated_buyer, "street2") or (buyer_addr.get("address_line_2") or "").strip() or None,
+        city=_get_field(validated_buyer, "city") or (buyer_addr.get("city") or ""),
+        state=_get_field(validated_buyer, "state") or (buyer_addr.get("state_province") or ""),
+        zip=_get_field(validated_buyer, "zip") or (buyer_addr.get("postal_code") or ""),
+        country=_get_field(validated_buyer, "country") or (buyer_addr.get("country") or "").upper(),
+    )
 
     # -------------------------
     # Create static parcel payload for card item
@@ -200,6 +230,29 @@ async def shippo_rates_handler(
     # -------------------------
     shipment_msgs = get_attr(shipment, "messages", []) or []
     normalized_msgs = [((get_attr(m, "text", "") or "").lower()) for m in shipment_msgs]
+
+    # Fail fast if carrier reports ambiguous or invalid address at shipment stage
+    if any(
+        (
+            ("failed_address_validation" in msg)
+            or ("multiple addresses" in msg)
+            or ("multiple records" in msg)
+        )
+        for msg in normalized_msgs
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Address validation failed",
+                "message": "The address matched multiple records. Please provide more specific details.",
+                "suggestions": [
+                    "Add apartment/suite number if applicable",
+                    "Double-check street name spelling",
+                    "Verify city and state/province",
+                    "Ensure postal/ZIP code is complete and correct",
+                ],
+            },
+        )
     api_logger.debug("Shipment messages: %s", normalized_msgs)
 
     # Log available raw rates for debugging

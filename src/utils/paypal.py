@@ -1,5 +1,4 @@
 import os
-import json
 import uuid
 import httpx
 from decimal import Decimal
@@ -10,9 +9,7 @@ from src.utils.logger import (
     log_error_with_context,
 )
 
-
-PAYPAL_ENV = os.environ.get("PAYPAL_ENV", "sandbox").lower()
-
+PAYPAL_ENV = "sandbox"
 
 def get_base_url(request: Request) -> str:
     # e.g. https://chaamo-backend.fly.dev

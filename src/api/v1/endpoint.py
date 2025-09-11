@@ -1,5 +1,6 @@
 import asyncio
 from typing import Optional, List, Dict, Any
+import os
 from fastapi import APIRouter, Query, HTTPException, Request, Depends
 
 from src.ebay_scraper import worker_manager as ebay_worker_manager
@@ -216,7 +217,7 @@ async def start_scrape_worker_get(
 # ===============================================================
 
 
-@router.post("/tcdb_scrape", summary="Start TCDB scraping")
+@router.post("/tcdb_scrape", summary="Start TCDB scraping - THIS ENDPOINT DISABLED ON PRODUCTION")
 async def start_tcdb_scrape(
     category_id: CategoryDropdown = Query(
         CategoryDropdown.TOPPS, description="Filter by brand category"
@@ -229,6 +230,9 @@ async def start_tcdb_scrape(
     ),
 ):
     """Start a TCDB scraping task based on a brand and optional browse category."""
+    env = (os.environ.get("ENV") or os.environ.get("APP_ENV") or "development").lower()
+    if env == "production":
+        raise HTTPException(status_code=403, detail="TCDB scraping is disabled in production")
     cat_id = CategoryDropdown.to_category_id(category_id)
     log_api_request(
         api_logger,
