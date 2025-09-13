@@ -4,6 +4,7 @@ import httpx
 from decimal import Decimal
 from fastapi import HTTPException, Request
 from typing import Optional, Tuple, Dict, Any
+from datetime import datetime
 from src.utils.logger import api_logger
 from src.utils.supabase import supabase
 
@@ -436,3 +437,165 @@ async def paypal_void_checkout(order_id: str) -> bool:
     except Exception:
         api_logger.exception("Unexpected error in paypal_void_checkout fallback")
         return False
+
+
+# ===============================================================
+# Cancel Subscription
+# ===============================================================
+async def paypal_cancel_subscription(subscription_id: str, reason: str | None = None) -> bool:
+    """
+    Cancel a PayPal billing subscription.
+
+    POST /v1/billing/subscriptions/{id}/cancel
+    Returns True if cancellation succeeded (204 expected), raises on non-2xx otherwise.
+    """
+    token = await get_access_token()
+    url = f"{get_api_base().rstrip('/')}/v1/billing/subscriptions/{subscription_id}/cancel"
+    payload = {"reason": (reason or "User requested cancellation")}
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+    if resp.status_code in (200, 202, 204):
+        return True
+    try:
+        err = resp.json()
+    except Exception:
+        err = {"error": resp.text[:500]}
+    api_logger.error("PayPal cancel subscription failed %s: %s", resp.status_code, err)
+    resp.raise_for_status()
+    return False
+
+
+# ===============================================================
+# Helper utilities (subscription flow) — migrated from handlers
+# ===============================================================
+def paypal_parse_iso_dt(s: Optional[str]) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat((s or "").replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+async def paypal_fetch_plan_fixed_price(plan_id_pp: Optional[str]) -> tuple:
+    """Return (amount, currency) for a PayPal billing plan's first billing cycle.
+    Defaults to (0, 'USD') on failure."""
+    if not plan_id_pp:
+        return 0, "USD"
+    try:
+        token2 = await get_access_token()
+        async with httpx.AsyncClient(timeout=20) as client:
+            pres = await client.get(
+                f"{get_api_base().rstrip('/')}/v1/billing/plans/{plan_id_pp}",
+                headers={"Authorization": f"Bearer {token2}"},
+            )
+            if pres.status_code == 200:
+                pjson = pres.json() or {}
+                cycles = pjson.get("billing_cycles") or []
+                if cycles:
+                    fixed = (
+                        (cycles[0].get("pricing_scheme") or {}).get("fixed_price")
+                        if isinstance(cycles[0], dict)
+                        else None
+                    )
+                    if fixed:
+                        return (
+                            fixed.get("value") or 0,
+                            fixed.get("currency_code") or "USD",
+                        )
+    except Exception:
+        api_logger.exception("Failed to fetch PayPal plan price; defaulting")
+    return 0, "USD"
+
+
+async def paypal_fetch_price_by_subscription_id(paypal_subscription_id: str) -> tuple:
+    """Fetch (amount, currency) for the plan behind a PayPal subscription id.
+    Defaults to (0, 'USD') on failure."""
+    try:
+        token2 = await get_access_token()
+        async with httpx.AsyncClient(timeout=20) as client:
+            sres = await client.get(
+                f"{get_api_base().rstrip('/')}/v1/billing/subscriptions/{paypal_subscription_id}",
+                headers={"Authorization": f"Bearer {token2}"},
+            )
+            if sres.status_code == 200:
+                sjson = sres.json() or {}
+                plan_id_pp = sjson.get("plan_id")
+                return await paypal_fetch_plan_fixed_price(plan_id_pp)
+    except Exception:
+        api_logger.exception("Failed to fetch price by subscription id; defaulting")
+    return 0, "USD"
+
+
+def paypal_compute_adjusted_start(user_id: str, plan_id: str, exclude_sub_id: Optional[str]) -> datetime:
+    """Return a start datetime that does not overlap any existing active periods for (user, plan)."""
+    now = datetime.now()
+    try:
+        overlap_rows = (
+            supabase.table("subscriptions")
+            .select("id, start_date, end_date")
+            .eq("user_id", user_id)
+            .eq("plan_id", plan_id)
+            .eq("status", "active")
+            .execute()
+        )
+        latest_end = None
+        for r in getattr(overlap_rows, "data", None) or []:
+            if exclude_sub_id and r.get("id") == exclude_sub_id:
+                continue
+            e = paypal_parse_iso_dt(r.get("end_date"))
+            if e and e > now and (latest_end is None or e > latest_end):
+                latest_end = e
+        if latest_end and latest_end > now:
+            return latest_end
+    except Exception:
+        api_logger.exception("Failed to compute adjusted start; using now")
+    return now
+
+
+async def paypal_ensure_linked_pending_payment(
+    sub_id: str,
+    user_id: str,
+    gateway_order_id: str,
+    amount,
+    currency: str,
+    gateway_account_info: Optional[dict] = None,
+):
+    """Ensure subscriptions.payment_id is set by creating a pending payment if needed."""
+    try:
+        sr = (
+            supabase.table("subscriptions")
+            .select("payment_id")
+            .eq("id", sub_id)
+            .limit(1)
+            .execute()
+        )
+        if getattr(sr, "data", None) and sr.data[0].get("payment_id"):
+            return
+        ins = (
+            supabase.table("payments")
+            .insert(
+                {
+                    "user_id": user_id,
+                    "gateway": "paypal",
+                    "gateway_order_id": gateway_order_id,
+                    "amount": amount,
+                    "currency": (currency or "USD"),
+                    "gateway_account_info": gateway_account_info or None,
+                    "status": "pending",
+                }
+            )
+            .execute()
+        )
+        if getattr(ins, "data", None):
+            pid = ins.data[0].get("id")
+            supabase.table("subscriptions").update({"payment_id": pid}).eq(
+                "id", sub_id
+            ).execute()
+    except Exception:
+        api_logger.exception("Failed to ensure linked pending payment")

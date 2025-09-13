@@ -8,6 +8,7 @@ from src.tcdb_scraper import tcdb_scrape_handler
 from src.paypal_handlers import (
     paypal_subscription_handler,
     paypal_subscription_return_handler,
+    paypal_subscription_cancel_handler,
     paypal_webhook_subscription_handler,
     paypal_order_handler,
     paypal_order_return_handler,
@@ -53,14 +54,14 @@ async def start_scrape_worker(
     region: Region = Query(Region.uk, description="Choose a region from 'us' or 'uk'"),
     category_id: Optional[CategoryDropdown] = Query(
         None,
-        description="Category filter - Required when using 'query', resolved automatically for 'user_card_id'",
+        description="Category filter - Required when using 'query', resolved automatically for 'card_id'",
     ),
     query: Optional[str] = Query(
         None, description="Search keyword (e.g., '2023 Topps Merlin Lamine Yamal')"
     ),
-    user_card_id: Optional[str] = Query(
+    card_id: Optional[str] = Query(
         None,
-        description="Alternative to query: Use existing user card ID from user_cards table",
+        description="Alternative to query: Use existing user card ID from cards table",
     ),
     max_pages: int = Query(50, description="Max pages to scrape (lower is faster)"),
     disable_proxy: bool = Query(
@@ -81,29 +82,29 @@ async def start_scrape_worker(
             "region": region.value,
             "category_id": cat_id.value if cat_id else None,
             "query": query,
-            "user_card_id": user_card_id,
+            "card_id": card_id,
             "max_pages": max_pages,
             "disable_proxy": disable_proxy,
         },
     )
 
     # Validation: enforce proper parameter combinations
-    if not query and not user_card_id:
+    if not query and not card_id:
         api_logger.warning(
-            "❌ Validation failed: either 'query' + 'category_id' or 'user_card_id' must be provided"
+            "❌ Validation failed: either 'query' + 'category_id' or 'card_id' must be provided"
         )
         raise HTTPException(
             status_code=400,
-            detail="Either 'query' + 'category_id' or 'user_card_id' must be provided",
+            detail="Either 'query' + 'category_id' or 'card_id' must be provided",
         )
 
-    if query and user_card_id:
+    if query and card_id:
         api_logger.warning(
-            "❌ Validation failed: cannot use both 'query' and 'user_card_id' simultaneously"
+            "❌ Validation failed: cannot use both 'query' and 'card_id' simultaneously"
         )
         raise HTTPException(
             status_code=400,
-            detail="Cannot use both 'query' and 'user_card_id' simultaneously. Choose one.",
+            detail="Cannot use both 'query' and 'card_id' simultaneously. Choose one.",
         )
 
     # Require category_id when using query mode
@@ -122,7 +123,7 @@ async def start_scrape_worker(
             query=query,
             region=region,
             category_id=cat_id,
-            user_card_id=user_card_id,
+            card_id=card_id,
             max_pages=max_pages,
         )
 
@@ -135,7 +136,7 @@ async def start_scrape_worker(
                     region,
                     CategoryId(task.category_id),
                     task.query,
-                    user_card_id,
+                    card_id,
                     max_pages,
                     None,  # master_card_id parameter
                     disable_proxy,  # Pass disable_proxy parameter
@@ -177,14 +178,14 @@ async def start_scrape_worker_get(
     region: Region = Query(Region.uk, description="Choose a region from 'us' or 'uk'"),
     category_id: Optional[CategoryId] = Query(
         None,
-        description="Category filter - Required when using 'query', resolved automatically for 'user_card_id'",
+        description="Category filter - Required when using 'query', resolved automatically for 'card_id'",
     ),
     query: Optional[str] = Query(
         None, description="Search keyword (e.g., '2023 Topps Merlin Lamine Yamal')"
     ),
-    user_card_id: Optional[str] = Query(
+    card_id: Optional[str] = Query(
         None,
-        description="Alternative to query: Use existing user card ID from user_cards table",
+        description="Alternative to query: Use existing user card ID from cards table",
     ),
     max_pages: int = Query(50, description="Max pages to scrape (lower is faster)"),
     disable_proxy: bool = Query(
@@ -199,7 +200,7 @@ async def start_scrape_worker_get(
         region=region,
         category_id=category_id,
         query=query,
-        user_card_id=user_card_id,
+        card_id=card_id,
         max_pages=max_pages,
         disable_proxy=disable_proxy,
         manager=manager,
@@ -319,7 +320,7 @@ async def get_worker_status(task_id: str, manager=Depends(get_worker_manager)):
 # ===============================================================
 
 
-@router.get("/paypal/subscription", summary="Start PayPal checkout")
+@router.get("/paypal/subscription", summary="PayPal subscription plan API")
 async def paypal_subscription(
     request: Request,
     user_id: str = Query(..., description="User ID"),
@@ -336,7 +337,29 @@ async def paypal_subscription(
     )
 
 
-@router.get("/paypal/subscription/return", summary="PayPal capture return URL")
+@router.get(
+    "/paypal/subscription/cancel", summary="PayPal cancel subscription plan API"
+)
+async def paypal_subscription_cancel(
+    redirect: str = Query(..., description="Original app redirect deep link"),
+    user_id: Optional[str] = Query(None, description="User ID"),
+    plan_id: Optional[str] = Query(None, description="Plan ID"),
+    subscription_id: Optional[str] = Query(
+        None, description="PayPal subscription ID token"
+    ),
+):
+    return await paypal_subscription_cancel_handler(
+        redirect=redirect,
+        user_id=user_id,
+        plan_id=plan_id,
+        subscription_id=subscription_id,
+    )
+
+
+@router.get(
+    "/paypal/subscription/return",
+    summary="PayPal subscription plan return redirect URL",
+)
 async def paypal_subscription_return(
     redirect: str = Query(..., description="Original app redirect deep link"),
     user_id: str = Query(..., description="User ID"),
@@ -353,19 +376,19 @@ async def paypal_subscription_return(
     )
 
 
-@router.post("/paypal/webhook/subscription")
+@router.post("/paypal/webhook/subscription", summary="PayPal subscription plan webhook")
 async def paypal_webhooks(request: Request):
     return await paypal_webhook_subscription_handler(request=request)
 
 
-@router.post("/paypal/order")
+@router.post("/paypal/order", summary="PayPal order API")
 async def create_paypal_order(
     request: Request, payload: TransactionPayload
 ) -> Dict[str, Any]:
     return await paypal_order_handler(request=request, payload=payload)
 
 
-@router.get("/paypal/order/return", summary="PayPal return URL")
+@router.get("/paypal/order/return", summary="PayPal order return redirect URL")
 async def paypal_return(
     redirect: str = Query(..., description="Original app redirect deep link"),
     token: Optional[str] = Query(None, description="PayPal order ID token"),
@@ -378,12 +401,14 @@ async def paypal_return(
     )
 
 
-@router.post("/paypal/webhook/order")
+@router.post("/paypal/webhook/order", summary="PayPal order webhook")
 async def paypal_webhook_order(request: Request):
     return await paypal_webhook_order_handler(request=request)
 
 
-@router.get("/paypal/cancel", summary="PayPal cancel URL")
+@router.get(
+    "/paypal/cancel", summary="PayPal cancel redirect URL for all types of PayPal APIs"
+)
 async def paypal_cancel(
     redirect: str = Query(..., description="Original app redirect deep link"),
     token: Optional[str] = Query(None, description="PayPal order ID token"),
@@ -397,7 +422,11 @@ async def paypal_cancel(
 # ===============================================================
 # SHIPPO ENDPOINT
 # ===============================================================
-@router.get("/shippo/rates", response_model=RateResponse)
+@router.get(
+    "/shippo/rates",
+    response_model=RateResponse,
+    summary="Shippo Get shipping rates API",
+)
 async def get_shipping_rates(
     seller_id: str,
     buyer_id: str,
@@ -414,6 +443,6 @@ async def get_shipping_rates(
     )
 
 
-@router.post("/shippo/webhooks")
+@router.post("/shippo/webhook", summary="Shippo webhook")
 async def shippo_webhook(request: Request):
     return await shippo_webhook_handler(request=request)

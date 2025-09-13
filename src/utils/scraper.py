@@ -446,7 +446,7 @@ async def scrape_ebay_html(
     region: Region,
     query: str | None = None,
     category_id: CategoryId | None = None,
-    user_card_id: str | None = None,
+    card_id: str | None = None,
     max_pages: int = 50,
     page_retries: int = 3,
     disable_proxy: bool = False,
@@ -455,29 +455,29 @@ async def scrape_ebay_html(
     final_query = query or "card"
     final_category_id = category_id
 
-    if user_card_id:
+    if card_id:
         try:
             response = (
-                supabase.table("user_cards")
-                .select("custom_name, category_id")
-                .eq("id", user_card_id)
+                supabase.table("cards")
+                .select("canonical_title, category_id")
+                .eq("id", card_id)
                 .limit(1)
                 .execute()
             )
             if response.data:
                 card_data = response.data[0]
-                final_query = card_data.get("custom_name") or "card"
+                final_query = card_data.get("canonical_title") or "card"
                 final_category_id = (
                     CategoryId(card_data.get("category_id"))
                     if card_data.get("category_id")
                     else None
                 )
                 scraper_logger.info(
-                    f"✅ Mode 2: Using user_card_id - query: '{final_query}'"
+                    f"✅ Mode 2: Using card_id - query: '{final_query}'"
                 )
         except Exception as e:
             scraper_logger.warning(
-                f"⚠️ Error resolving user_card_id {user_card_id}: {e}"
+                f"⚠️ Error resolving card_id {card_id}: {e}"
             )
 
     if query and category_id:
@@ -1094,12 +1094,12 @@ def _extract_serial_number(text: str) -> str | None:
 
 
 # ===============================================================
-# Step 4: upsert ebay_posts (supabase) + update user_cards if user_card_id mode
+# Step 4: upsert ebay_posts (supabase) + update cards if card_id mode
 # ===============================================================
 
 
 async def upsert_ebay_listings(
-    posts: list[dict[str, any]], user_card_id: str | None = None
+    posts: list[dict[str, any]], card_id: str | None = None
 ) -> dict[str, any]:
     """
     Upsert posts into supabase table `ebay_posts`. If embedding present, store it in embedding column.
@@ -1159,27 +1159,27 @@ async def upsert_ebay_listings(
 # ===============================================================
 
 
-async def update_user_card(
-    selected_post: dict[str, any], user_card_id: str
+async def update_card(
+    selected_post: dict[str, any], card_id: str
 ) -> dict[str, any]:
-    results = {"user_card_updated": False, "errors": []}
+    results = {"card_updated": False, "errors": []}
     try:
         update_data = {
+            "last_sold_post_url": selected_post.get("sold_post_url"),
             "last_sold_price": selected_post.get("sold_price"),
             "last_sold_currency": selected_post.get("sold_currency"),
             "last_sold_at": selected_post.get("sold_date"),
-            "last_sold_post_url": selected_post.get("sold_post_url"),
         }
-        supabase.table("user_cards").update(update_data).eq(
-            "id", user_card_id
+        supabase.table("cards").update(update_data).eq(
+            "id", card_id
         ).execute()
-        results["user_card_updated"] = True
+        results["card_updated"] = True
         scraper_logger.info(
-            f"✅ Updated user_card {user_card_id}: price={selected_post.get('sold_price')} {selected_post.get('sold_currency')}"
+            f"✅ Updated card {card_id}: price={selected_post.get('sold_price')} {selected_post.get('sold_currency')}"
         )
     except Exception as e:
         results["errors"].append(str(e))
-        scraper_logger.error(f"❌ Failed update user_cards: {e}")
+        scraper_logger.error(f"❌ Failed update cards: {e}")
     return results
 
 
