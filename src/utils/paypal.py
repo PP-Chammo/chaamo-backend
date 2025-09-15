@@ -7,6 +7,8 @@ from typing import Optional, Tuple, Dict, Any
 from datetime import datetime
 from src.utils.logger import api_logger
 from src.utils.supabase import supabase
+ 
+ 
 
 PAYPAL_ENV = "sandbox"
 
@@ -26,7 +28,7 @@ def paypal_get_env() -> str:
     return (os.getenv("PAYPAL_ENV") or PAYPAL_ENV).lower()
 
 
-def get_base_url(request: Request) -> str:
+def paypal_get_base_url(request: Request) -> str:
     # e.g. https://chaamo-backend.fly.dev
     return str(request.base_url).rstrip("/")
 
@@ -88,7 +90,28 @@ async def get_access_token() -> str:
 
 
 # ===============================================================
-# Create Subscription
+# Get Order Details
+# ===============================================================
+async def paypal_get_order(order_id: str) -> dict:
+    """Fetch full PayPal order details (payer, payment_source, etc.).
+    GET /v2/checkout/orders/{order_id}
+    Returns parsed JSON or raises httpx.HTTPStatusError on non-2xx.
+    """
+    token = await get_access_token()
+    url = f"{get_api_base().rstrip('/')}/v2/checkout/orders/{order_id}"
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+    resp.raise_for_status()
+    return resp.json()
+
+# ===============================================================
+# mutators — create/update/cancel actions
 # ===============================================================
 
 
@@ -271,25 +294,7 @@ async def paypal_create_order(
     }
 
 
-# ===============================================================
-# Capture Order
-# ===============================================================
-async def paypal_capture_order(paypal_order_id: str) -> Dict[str, Any]:
-    access_token = await get_access_token()
-    capture_url = (
-        f"{get_api_base().rstrip('/')}/v2/checkout/orders/{paypal_order_id}/capture"
-    )
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(
-            capture_url,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
-            json={},  # PayPal capture endpoint expects empty JSON body
-        )
-    resp.raise_for_status()
-    return resp.json()
+ 
 
 
 # ===============================================================
@@ -300,19 +305,28 @@ async def paypal_authorize_order(order_id: str) -> Dict[str, Any]:
     POST /v2/checkout/orders/{order_id}/authorize
     Returns the parsed JSON response which includes authorizations.
     """
-    token = await get_access_token()
-    url = f"{get_api_base().rstrip('/')}/v2/checkout/orders/{order_id}/authorize"
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json={},
-        )
-    resp.raise_for_status()
-    return resp.json()
+    try:
+        token = await get_access_token()
+        url = f"{get_api_base().rstrip('/')}/v2/checkout/orders/{order_id}/authorize"
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json={},
+            )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as he:
+        api_logger.error("PayPal authorize failed: %s", getattr(he.response, "text", he))
+        # Re-raise so callers (e.g., paypal_void_checkout) can handle gracefully
+        raise
+    except Exception as e:
+        api_logger.exception("PayPal authorize unexpected error: %s", e)
+        # Propagate original error to be handled by caller logic
+        raise
 
 
 # ===============================================================
@@ -324,56 +338,70 @@ async def paypal_void_authorization(authorization_id: str) -> bool:
     POST /v2/payments/authorizations/{authorization_id}/void
     Returns True if void succeeded (204 expected), raises on non-2xx.
     """
-    token = await get_access_token()
-    url = f"{get_api_base().rstrip('/')}/v2/payments/authorizations/{authorization_id}/void"
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json={},
-        )
-    if resp.status_code in (200, 204):
+    try:
+        token = await get_access_token()
+        url = f"{get_api_base().rstrip('/')}/v2/payments/authorizations/{authorization_id}/void"
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json={},
+            )
+        if resp.status_code in (200, 204):
+            return True
+        resp.raise_for_status()
         return True
-    resp.raise_for_status()
-    return True
+    except httpx.HTTPStatusError as he:
+        api_logger.error("PayPal void authorization failed: %s", getattr(he.response, "text", he))
+        raise HTTPException(status_code=502, detail="Payment provider void error")
+    except Exception as e:
+        api_logger.exception("PayPal void authorization unexpected error: %s", e)
+        raise HTTPException(status_code=500, detail="Payment provider void error")
 
 
-# ===============================================================
-# Capture Authorization
-# ===============================================================
-async def paypal_capture_authorization(
-    authorization_id: str,
-    amount: Optional[Decimal] = None,
-    currency: Optional[str] = None,
-) -> Dict[str, Any]:
+async def paypal_capture_authorization(authorization_id: str, amount: str | None = None, currency: str | None = None) -> dict:
     """
-    Capture an authorization:
+    Capture a previously authorized payment.
     POST /v2/payments/authorizations/{authorization_id}/capture
-    If amount provided, pass it; otherwise let PayPal do full capture.
+    If amount/currency are omitted, full capture is attempted.
+    Returns the parsed JSON response from PayPal.
     """
-    token = await get_access_token()
-    url = f"{get_api_base().rstrip('/')}/v2/payments/authorizations/{authorization_id}/capture"
-    payload: Dict[str, Any] = {}
-    if amount is not None and currency:
-        payload["amount"] = {
-            "value": f"{amount.quantize(Decimal('0.01'))}",
-            "currency_code": currency,
-        }
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-    resp.raise_for_status()
-    return resp.json()
+    try:
+        token = await get_access_token()
+        url = f"{get_api_base().rstrip('/')}/v2/payments/authorizations/{authorization_id}/capture"
+        payload: dict = {}
+        if amount and currency:
+            payload["amount"] = {"value": str(amount), "currency_code": currency}
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        # If already captured, PayPal may return 422 with specific error; let caller decide idempotency handling
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as he:
+        # Surface PayPal error body for diagnostics
+        try:
+            err_body = he.response.json()
+        except Exception:
+            err_body = getattr(he.response, "text", str(he))
+        api_logger.error("PayPal capture failed: %s", err_body)
+        raise
+    except Exception as e:
+        api_logger.exception("PayPal capture unexpected error: %s", e)
+        raise
 
+
+
+ 
 
 # ===============================================================
 # Void Checkout
@@ -473,7 +501,7 @@ async def paypal_cancel_subscription(subscription_id: str, reason: str | None = 
 
 
 # ===============================================================
-# Helper utilities (subscription flow) — migrated from handlers
+# getters — fetch/read helpers (plans, subscriptions)
 # ===============================================================
 def paypal_parse_iso_dt(s: Optional[str]) -> Optional[datetime]:
     try:
@@ -526,19 +554,21 @@ async def paypal_fetch_price_by_subscription_id(paypal_subscription_id: str) -> 
             if sres.status_code == 200:
                 sjson = sres.json() or {}
                 plan_id_pp = sjson.get("plan_id")
-                return await paypal_fetch_plan_fixed_price(plan_id_pp)
     except Exception:
         api_logger.exception("Failed to fetch price by subscription id; defaulting")
     return 0, "USD"
 
 
-def paypal_compute_adjusted_start(user_id: str, plan_id: str, exclude_sub_id: Optional[str]) -> datetime:
+# ===============================================================
+# utilities — compute/parse helpers (local DB related)
+# ===============================================================
+async def paypal_compute_adjusted_start(user_id: str, plan_id: str, exclude_sub_id: Optional[str]) -> datetime:
     """Return a start datetime that does not overlap any existing active periods for (user, plan)."""
     now = datetime.now()
     try:
         overlap_rows = (
             supabase.table("subscriptions")
-            .select("id, start_date, end_date")
+            .select("id, start_time, end_time")
             .eq("user_id", user_id)
             .eq("plan_id", plan_id)
             .eq("status", "active")
@@ -548,7 +578,7 @@ def paypal_compute_adjusted_start(user_id: str, plan_id: str, exclude_sub_id: Op
         for r in getattr(overlap_rows, "data", None) or []:
             if exclude_sub_id and r.get("id") == exclude_sub_id:
                 continue
-            e = paypal_parse_iso_dt(r.get("end_date"))
+            e = paypal_parse_iso_dt(r.get("end_time"))
             if e and e > now and (latest_end is None or e > latest_end):
                 latest_end = e
         if latest_end and latest_end > now:
@@ -558,44 +588,4 @@ def paypal_compute_adjusted_start(user_id: str, plan_id: str, exclude_sub_id: Op
     return now
 
 
-async def paypal_ensure_linked_pending_payment(
-    sub_id: str,
-    user_id: str,
-    gateway_order_id: str,
-    amount,
-    currency: str,
-    gateway_account_info: Optional[dict] = None,
-):
-    """Ensure subscriptions.payment_id is set by creating a pending payment if needed."""
-    try:
-        sr = (
-            supabase.table("subscriptions")
-            .select("payment_id")
-            .eq("id", sub_id)
-            .limit(1)
-            .execute()
-        )
-        if getattr(sr, "data", None) and sr.data[0].get("payment_id"):
-            return
-        ins = (
-            supabase.table("payments")
-            .insert(
-                {
-                    "user_id": user_id,
-                    "gateway": "paypal",
-                    "gateway_order_id": gateway_order_id,
-                    "amount": amount,
-                    "currency": (currency or "USD"),
-                    "gateway_account_info": gateway_account_info or None,
-                    "status": "pending",
-                }
-            )
-            .execute()
-        )
-        if getattr(ins, "data", None):
-            pid = ins.data[0].get("id")
-            supabase.table("subscriptions").update({"payment_id": pid}).eq(
-                "id", sub_id
-            ).execute()
-    except Exception:
-        api_logger.exception("Failed to ensure linked pending payment")
+ 

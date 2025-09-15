@@ -344,6 +344,50 @@ async def shippo_validate_address(address_data: dict):
         raise HTTPException(status_code=500, detail="Address validation service error")
 
 
+async def shippo_validate_and_merge(address_input: dict) -> dict:
+    """
+    High-level helper used by handlers to validate an address and merge normalized
+    fields into the original dict, returning a finalized address payload suitable
+    for Shippo shipment creation. Avoids duplicating normalization code in handlers.
+
+    Behavior:
+    - Calls shippo_validate_address(address_input)
+    - Returns a new dict containing the merged normalized fields (street1/2, city,
+      state, zip, country, optional object_id if present) and sets
+      validation_results.is_valid=True for downstream logic.
+    - Raises HTTPException on provider errors (auth, rate limit, network) consistent
+      with shippo_validate_address.
+    """
+    validated = await shippo_validate_address(address_input)
+
+    def _get(obj, field):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get(field)
+        return getattr(obj, field, None)
+
+    merged = dict(address_input or {})
+    norm_street1 = _get(validated, "street1")
+    if norm_street1:
+        merged.update(
+            {
+                "street1": norm_street1,
+                "street2": _get(validated, "street2") or merged.get("street2", ""),
+                "city": _get(validated, "city") or merged.get("city", ""),
+                "state": _get(validated, "state") or merged.get("state", ""),
+                "zip": _get(validated, "zip") or merged.get("zip", ""),
+                "country": _get(validated, "country") or merged.get("country", ""),
+                "object_id": _get(validated, "object_id") or merged.get("object_id"),
+                "validation_results": {"is_valid": True, "messages": []},
+            }
+        )
+    else:
+        # Ensure validation flag even when no normalized fields surfaced
+        merged.setdefault("validation_results", {"is_valid": True, "messages": []})
+
+    return merged
+
 def _get_env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 

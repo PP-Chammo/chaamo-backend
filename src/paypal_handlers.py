@@ -10,43 +10,57 @@ from decimal import Decimal, InvalidOperation
 
 from src.utils.shippo import shippo_sdk
 from src.models.shippo import TransactionPayload
-from src.utils.supabase import supabase
+from src.utils.supabase import (
+    supabase_get_subscription,
+    supabase_get_subscriptions,
+    supabase_get_order,
+    supabase_get_orders,
+    supabase_get_payment,
+    supabase_get_payments,
+    supabase_get_membership_plan,
+    supabase_get_listing_card,
+    supabase_get_profile,
+    supabase_get_user_address,
+    supabase_get_card,
+    supabase_mutate_payment,
+    supabase_mutate_subscription,
+    supabase_mutate_order,
+    supabase_delete_order,
+)
 from src.utils.currency import format_price
 from src.utils.shippo import (
     shippo_get_rate_details,
-    shippo_validate_address,
+    shippo_validate_and_merge,
     shippo_build_shipment_and_select_rate,
 )
 from src.utils.paypal import (
     get_access_token,
-    get_base_url,
     get_api_base,
+    paypal_get_base_url,
     paypal_create_subscription,
     paypal_create_order,
     paypal_void_checkout,
     paypal_void_authorization,
     paypal_authorize_order,
     paypal_capture_authorization,
-    paypal_capture_order,
+    paypal_get_order,
     paypal_cancel_subscription,
     paypal_fetch_plan_fixed_price,
     paypal_fetch_price_by_subscription_id,
     paypal_compute_adjusted_start,
-    paypal_ensure_linked_pending_payment,
     paypal_parse_iso_dt,
 )
 from src.utils.logger import (
     api_logger,
     log_api_request,
+    log_success,
+    log_failure,
 )
 
 
 # ===============================================================
 # /paypal/subscription
 # ===============================================================
-
-
-
 
 
 async def paypal_subscription_handler(
@@ -62,55 +76,56 @@ async def paypal_subscription_handler(
         {"user_id": user_id, "plan_id": plan_id, "redirect": redirect},
     )
     try:
-        # 1. ambil paypal_plan_id
-        plan_resp = (
-            supabase.table("membership_plans")
-            .select("id, paypal_plan_id")
-            .eq("id", plan_id)
-            .execute()
+        # 1. get paypal_plan_id
+        membership_plan = supabase_get_membership_plan(
+            {"id": plan_id}, columns="id,paypal_plan_id,subscription_days"
         )
-        if not plan_resp.data:
+        if not membership_plan:
+            api_logger.error(
+                "Membership plan not found for plan_id=%s in paypal_subscription_handler",
+                plan_id,
+            )
             raise HTTPException(status_code=404, detail="Plan not found")
-        row = plan_resp.data[0]
-        paypal_plan_id = row.get("paypal_plan_id")
+        paypal_plan_id = membership_plan.get("paypal_plan_id")
         if not paypal_plan_id:
+            api_logger.error(
+                "Plan %s missing paypal_plan_id in membership_plans", plan_id
+            )
             raise HTTPException(
                 status_code=400, detail="Plan does not have PayPal plan id"
             )
 
         # Guard: prevent duplicate active subscription period for same user/plan
-        try:
-            now_dt = datetime.now()
-            existing_active = (
-                supabase.table("subscriptions")
-                .select("id, start_date, end_date, status")
-                .eq("user_id", user_id)
-                .eq("plan_id", plan_id)
-                .eq("status", "active")
-                .execute()
-            )
-            if getattr(existing_active, "data", None):
-                for row in existing_active.data:
-                    start_dt = paypal_parse_iso_dt(row.get("start_date"))
-                    end_dt = paypal_parse_iso_dt(row.get("end_date"))
-                    # Block only if now is within [start_date, end_date)
-                    if start_dt and end_dt and start_dt <= now_dt < end_dt:
-                        # Already in an active period; block new purchase
-                        params = urlencode(
-                            {
-                                "status": "error",
-                                "reason": "already_active",
-                            }
-                        )
-                        return RedirectResponse(
-                            f"{redirect}{'&' if '?' in redirect else '?'}{params}",
-                            status_code=302,
-                        )
-        except Exception:
-            api_logger.exception("Active subscription guard check failed (continuing)")
+        now_dt = datetime.now()
+        active_subscriptions = supabase_get_subscriptions(
+            {"user_id": user_id, "status": "active"},
+            columns="id, start_time, end_time, status",
+        )
+        if active_subscriptions:
+            for active_subscription in active_subscriptions:
+                start_dt = paypal_parse_iso_dt(active_subscription.get("start_time"))
+                end_dt = paypal_parse_iso_dt(active_subscription.get("end_time"))
+                # Block only if now is within [start_time, end_time)
+                if start_dt and end_dt and start_dt <= now_dt < end_dt:
+                    # Already in an active period; block new purchase
+                    api_logger.info(
+                        "Blocking new subscription: user_id=%s already active for plan_id=%s",
+                        user_id,
+                        plan_id,
+                    )
+                    params = urlencode(
+                        {
+                            "status": "error",
+                            "reason": "already_active",
+                        }
+                    )
+                    return RedirectResponse(
+                        f"{redirect}{'&' if '?' in redirect else '?'}{params}",
+                        status_code=302,
+                    )
 
         # 2. build return/cancel urls (include internal plan_id so return handler can use it)
-        base = get_base_url(request)
+        base = paypal_get_base_url(request)
         return_url = f"{base}/api/v1/paypal/subscription/return?{urlencode({'redirect': redirect, 'user_id': user_id, 'plan_id': plan_id})}"
         cancel_url = f"{base}/api/v1/paypal/cancel?{urlencode({'redirect': redirect})}"
 
@@ -130,69 +145,78 @@ async def paypal_subscription_handler(
             raise HTTPException(status_code=500, detail="Payment provider error")
 
         # 3. Persist or reuse a single 'pending' subscription per user/plan
-        try:
-            # Reuse or create: prefer updating an existing pending row for this user+plan
-            pending_res = (
-                supabase.table("subscriptions")
-                .select("id, payment_id, paypal_subscription_id, status")
-                .eq("user_id", user_id)
-                .eq("plan_id", plan_id)
-                .eq("status", "pending")
-                .limit(1)
-                .execute()
-            )
-            primary_id = None
-            if getattr(pending_res, "data", None):
-                row0 = pending_res.data[0]
-                primary_id = row0.get("id")
-                # Cancel any linked pending payment and unlink
-                try:
-                    pid = row0.get("payment_id")
-                    if pid:
-                        supabase.table("payments").update({"status": "cancelled"}).eq(
-                            "id", pid
-                        ).execute()
-                        supabase.table("subscriptions").update({"payment_id": None}).eq(
-                            "id", primary_id
-                        ).execute()
-                except Exception:
-                    api_logger.exception(
-                        "Failed to cancel/unlink previous pending payment for subscription reuse"
-                    )
-                # Update existing pending row with the latest PayPal subscription id
-                supabase.table("subscriptions").update(
-                    {"paypal_subscription_id": subscription_id}
-                ).eq("id", primary_id).execute()
-                # Cancel any other pending duplicates for safety
-                try:
-                    supabase.table("subscriptions").update({"status": "cancelled"}).eq(
-                        "user_id", user_id
-                    ).eq("plan_id", plan_id).eq("status", "pending").neq(
-                        "id", primary_id
-                    ).execute()
-                except Exception:
-                    api_logger.exception(
-                        "Failed to cancel duplicate pending subscriptions for user/plan"
-                    )
-            else:
-                ins = (
-                    supabase.table("subscriptions")
-                    .insert(
-                        {
-                            "user_id": user_id,
-                            "plan_id": plan_id,
-                            "status": "pending",
-                            "paypal_subscription_id": subscription_id,
-                            "start_date": None,
-                            "end_date": None,
-                        }
-                    )
-                    .execute()
+        # Reuse or create: prefer updating an existing pending row for this user+plan
+        primary_id = None
+        pending_subscriptions = supabase_get_subscriptions(
+            {"user_id": user_id, "status": "pending"},
+            columns="id,payment_id,paypal_subscription_id,status",
+        )
+        pending_subscription = (
+            pending_subscriptions[0] if pending_subscriptions else None
+        )
+        if pending_subscription:
+            primary_id = pending_subscription.get("id")
+            # Cancel any linked pending payment and unlink
+            pending_payment_id = pending_subscription.get("payment_id")
+            if pending_payment_id:
+                supabase_mutate_payment(
+                    "update", {"status": "cancelled"}, {"id": pending_payment_id}
                 )
-                primary_id = ins.data[0]["id"] if getattr(ins, "data", None) else None
-        except Exception:
-            api_logger.exception(
-                "Failed to persist/reuse pending subscription; continuing to redirect to PayPal"
+                supabase_mutate_subscription(
+                    "update",
+                    {"payment_id": None},
+                    {"id": primary_id},
+                )
+                api_logger.info(
+                    "Cancelled and unlinked pending payment %s for subscription %s",
+                    pending_payment_id,
+                    primary_id,
+                )
+            # Update existing pending row with the latest PayPal subscription id
+            supabase_mutate_subscription(
+                "update",
+                {"paypal_subscription_id": subscription_id},
+                {"id": primary_id},
+            )
+            log_success(
+                api_logger,
+                f"Updated pending subscription {primary_id} with paypal_subscription_id={subscription_id}",
+            )
+            # Cancel any other pending duplicates for safety
+            supabase_mutate_subscription(
+                "update",
+                {"status": "cancelled"},
+                {
+                    "user_id": user_id,
+                    "plan_id": plan_id,
+                    "status": "pending",
+                    "id": {"neq": primary_id},
+                },
+            )
+            log_success(
+                api_logger,
+                f"Cancelled duplicate pending subscriptions for user_id={user_id} plan_id={plan_id} keeping id={primary_id}",
+            )
+        else:
+            inserted_subscription = supabase_mutate_subscription(
+                "insert",
+                {
+                    "user_id": user_id,
+                    "plan_id": plan_id,
+                    "status": "pending",
+                    "paypal_subscription_id": subscription_id,
+                    "start_time": None,
+                    "end_time": None,
+                },
+            )
+            primary_id = (
+                inserted_subscription.data[0]["id"]
+                if getattr(inserted_subscription, "data", None)
+                else None
+            )
+            log_success(
+                api_logger,
+                f"Inserted pending subscription id={primary_id} for user_id={user_id} plan_id={plan_id}",
             )
 
         # 4. redirect user to PayPal approval page
@@ -221,77 +245,77 @@ async def paypal_subscription_cancel_handler(
         {"user_id": user_id, "plan_id": plan_id, "subscription_id": subscription_id},
     )
     try:
-        sub_row = None
+        paypal_subscription = None
         # Resolve local subscription row
         if subscription_id:
-            res = (
-                supabase.table("subscriptions")
-                .select("id, paypal_subscription_id")
-                .eq("paypal_subscription_id", subscription_id)
-                .limit(1)
-                .execute()
+            paypal_subscription = supabase_get_subscription(
+                {"paypal_subscription_id": subscription_id}
             )
-            if getattr(res, "data", None):
-                sub_row = res.data[0]
         elif user_id and plan_id:
-            # Prefer the latest pending/active row for this user+plan
-            res = (
-                supabase.table("subscriptions")
-                .select("id, paypal_subscription_id")
-                .eq("user_id", user_id)
-                .eq("plan_id", plan_id)
-                .in_("status", ["pending", "active"])
-                .order("created_at", desc=True)
-                .limit(1)
-                .execute()
+            # Prefer pending, else active for this user+plan
+            paypal_subscription = supabase_get_subscription(
+                {"user_id": user_id, "plan_id": plan_id, "status": "pending"}
             )
-            if getattr(res, "data", None):
-                sub_row = res.data[0]
+            if not paypal_subscription:
+                paypal_subscription = supabase_get_subscription(
+                    {"user_id": user_id, "plan_id": plan_id, "status": "active"}
+                )
 
         # Attempt remote cancellation if we have a PayPal id
-        pp_id = subscription_id or (
-            sub_row.get("paypal_subscription_id") if sub_row else None
+        paypal_id = subscription_id or (
+            paypal_subscription.get("paypal_subscription_id")
+            if paypal_subscription
+            else None
         )
-        if pp_id:
+        if paypal_id:
             try:
                 await paypal_cancel_subscription(
-                    pp_id, reason="User cancelled at approval"
+                    paypal_id, reason="User cancelled at approval"
                 )
-            except Exception:
+                log_success(api_logger, f"Cancelled PayPal subscription {paypal_id} remotely")
+            except Exception as e:
                 api_logger.exception(
-                    "PayPal remote subscription cancel failed (non-fatal)"
+                    "Failed to cancel PayPal subscription %s remotely: %s",
+                    paypal_id,
+                    e,
                 )
 
         # Update local status to cancelled
-        try:
-            if sub_row and sub_row.get("id"):
-                supabase.table("subscriptions").update({"status": "cancelled"}).eq(
-                    "id", sub_row.get("id")
-                ).execute()
-            elif pp_id:
-                supabase.table("subscriptions").update({"status": "cancelled"}).eq(
-                    "paypal_subscription_id", pp_id
-                ).execute()
-        except Exception:
-            api_logger.exception("Failed to update local subscription to cancelled")
+        if paypal_subscription and paypal_subscription.get("id"):
+            supabase_mutate_subscription(
+                "update", {"status": "cancelled"}, {"id": paypal_subscription.get("id")}
+            )
+            log_success(
+                api_logger,
+                f"Marked local subscription {paypal_subscription.get('id')} as cancelled",
+            )
+        elif paypal_id:
+            supabase_mutate_subscription(
+                "update", {"status": "cancelled"}, {"paypal_subscription_id": paypal_id}
+            )
+            log_success(
+                api_logger,
+                f"Marked local subscription with paypal_subscription_id={paypal_id} as cancelled",
+            )
 
-        params = urlencode(
-            {
-                "status": "cancel",
-                "subscriptionId": pp_id or "",
-            }
+        redirect_params = urlencode(
+            {"status": "cancel", "subscriptionId": paypal_id or ""}
         )
         return RedirectResponse(
-            url=f"{redirect}{'&' if '?' in redirect else '?'}{params}",
+            url=f"{redirect}{'&' if '?' in redirect else '?'}{redirect_params}",
             status_code=302,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         api_logger.exception("Error handling PayPal subscription cancel: %s", e)
-        params = urlencode(
+        # Fall back to a safe redirect
+        redirect_params = urlencode(
             {"status": "cancel", "subscriptionId": subscription_id or ""}
         )
         return RedirectResponse(
-            url=f"{redirect}{'&' if '?' in redirect else '?'}{params}", status_code=302
+            url=f"{redirect}{'&' if '?' in redirect else '?'}{redirect_params}",
+            status_code=302,
         )
 
 
@@ -321,10 +345,11 @@ async def paypal_subscription_return_handler(
             params = urlencode({"status": "error", "reason": "missing_params"})
             return RedirectResponse(f"{redirect}?{params}", status_code=302)
 
+        paypal_sub_id = subscription_id  # preserve provided PayPal subscription id
         token = await get_access_token()
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(
-                f"{get_api_base().rstrip('/')}/v1/billing/subscriptions/{subscription_id}",
+                f"{get_api_base().rstrip('/')}/v1/billing/subscriptions/{paypal_sub_id}",
                 headers={"Authorization": f"Bearer {token}"},
             )
             resp.raise_for_status()
@@ -332,92 +357,120 @@ async def paypal_subscription_return_handler(
 
         # We do NOT activate locally here; leave subscription as pending until webhook.
         # Ensure internal subscription mapping exists (idempotent) without creating duplicates
-        sub_id = None
-        existing = (
-            supabase.table("subscriptions")
-            .select("id, user_id, plan_id, status, payment_id")
-            .eq("paypal_subscription_id", subscription_id)
-            .limit(1)
-            .execute()
+        local_subscription_id = None
+        existing_subscription = supabase_get_subscription(
+            {"paypal_subscription_id": paypal_sub_id}
         )
-        if getattr(existing, "data", None):
-            sub_row = existing.data[0]
-            sub_id = sub_row["id"]
-            try:
-                supabase.table("subscriptions").update(
-                    {
-                        "status": sub_row.get("status") or "pending",
-                    }
-                ).eq("id", sub_id).execute()
-            except Exception:
-                api_logger.exception("Failed to keep subscription pending on return")
+        if existing_subscription:
+            supabase_mutate_subscription(
+                "update",
+                {
+                    "status": existing_subscription.get("status") or "pending",
+                },
+                {"id": existing_subscription.get("id")},
+            )
+            local_subscription_id = existing_subscription.get("id")
+            log_success(
+                api_logger,
+                f"Found existing local subscription id={local_subscription_id} for paypal_subscription_id={paypal_sub_id}",
+            )
         else:
             # Reuse any existing pending for this user+plan to avoid duplicates
-            try:
-                fallback = (
-                    supabase.table("subscriptions")
-                    .select("id")
-                    .eq("user_id", user_id)
-                    .eq("plan_id", plan_id)
-                    .eq("status", "pending")
-                    .limit(1)
-                    .execute()
-                )
-                if getattr(fallback, "data", None):
-                    sub_id = fallback.data[0]["id"]
-                    supabase.table("subscriptions").update(
-                        {
-                            "paypal_subscription_id": subscription_id,
-                        }
-                    ).eq("id", sub_id).execute()
-                else:
-                    insert_resp = (
-                        supabase.table("subscriptions")
-                        .insert(
-                            {
-                                "user_id": user_id,
-                                "plan_id": plan_id,
-                                "status": "pending",
-                                "paypal_subscription_id": subscription_id,
-                                "start_date": None,
-                                "end_date": None,
-                            }
-                        )
-                        .execute()
-                    )
-                    sub_id = insert_resp.data[0]["id"]
-            except Exception:
-                api_logger.exception("Failed to upsert pending subscription on return")
-
-        # Insert a pending payment and link it to subscription via subscriptions.payment_id (idempotent)
-        try:
-            if sub_id:
-                # Parse subscriber email for gateway_account_info if available
-                subscriber = data.get("subscriber") or {}
-                gai = {}
-                email = subscriber.get("email_address")
-                if email:
-                    gai["email"] = email
-                plan_amount, plan_currency = await paypal_fetch_plan_fixed_price(
-                    data.get("plan_id")
-                )
-                await paypal_ensure_linked_pending_payment(
-                    sub_id=sub_id,
-                    user_id=user_id,
-                    gateway_order_id=subscription_id,
-                    amount=plan_amount,
-                    currency=plan_currency,
-                    gateway_account_info=gai,
-                )
-        except Exception:
-            api_logger.exception(
-                "Failed to insert pending subscription payment on return"
+            fallback_subscription = supabase_get_subscription(
+                {"user_id": user_id, "plan_id": plan_id, "status": "pending"}
             )
+            if fallback_subscription:
+                supabase_mutate_subscription(
+                    "update",
+                    {"paypal_subscription_id": paypal_sub_id},
+                    {"id": fallback_subscription.get("id")},
+                )
+                local_subscription_id = fallback_subscription.get("id")
+                log_success(
+                    api_logger,
+                    f"Linked pending local subscription id={local_subscription_id} to paypal_subscription_id={paypal_sub_id}",
+                )
+            else:
+                inserted_subscription = supabase_mutate_subscription(
+                    "insert",
+                    {
+                        "user_id": user_id,
+                        "plan_id": plan_id,
+                        "status": "pending",
+                        "paypal_subscription_id": paypal_sub_id,
+                        "start_time": None,
+                        "end_time": None,
+                    },
+                )
+                if not getattr(inserted_subscription, "data", None):
+                    api_logger.error(
+                        "Failed to insert local subscription mapping on return"
+                    )
+                else:
+                    local_subscription_id = inserted_subscription.data[0].get("id")
+                    log_success(
+                        api_logger,
+                        f"Inserted local subscription mapping id={local_subscription_id} for paypal_subscription_id={paypal_sub_id}",
+                    )
+        # Insert a pending payment and link it via subscriptions.payment_id (idempotent, explicit steps)
+        if local_subscription_id:
+            # Step 1: read subscription
+            subscription = supabase_get_subscription({"id": local_subscription_id})
+            # Step 2: if no linked payment, insert one
+            if not subscription or not subscription.get("payment_id"):
+                gateway_account_info = {}
+                subscriber = data.get("subscriber")
+                if not subscriber:
+                    log_failure(
+                        api_logger,
+                        "PayPal return: missing subscriber in subscription details",
+                    )
+                else:
+                    email = subscriber.get("email_address")
+                    if email:
+                        gateway_account_info["email"] = email
+
+                plan_id_val = data.get("plan_id")
+                if not plan_id_val:
+                    log_failure(
+                        api_logger,
+                        "PayPal return: missing plan_id in subscription details; skipping pending payment insert",
+                    )
+                else:
+                    plan_amount, plan_currency = await paypal_fetch_plan_fixed_price(
+                        plan_id_val
+                    )
+                    inserted_payment = supabase_mutate_payment(
+                        "insert",
+                        {
+                            "user_id": user_id,
+                            "gateway": "paypal",
+                            "gateway_order_id": paypal_sub_id,
+                            "amount": plan_amount,
+                            "currency": (plan_currency or "USD"),
+                            "gateway_account_info": gateway_account_info or None,
+                            "status": "pending",
+                        },
+                    )
+                    # Step 3: if inserted, link it on subscription
+                    if getattr(inserted_payment, "data", None):
+                        pid = inserted_payment.data[0].get("id")
+                        supabase_mutate_subscription(
+                            "update",
+                            {"payment_id": pid},
+                            {"id": local_subscription_id},
+                        )
+                        log_success(
+                            api_logger,
+                            f"Linked payment {pid} to local subscription {local_subscription_id}",
+                        )
 
         # Redirect to client
-        params = urlencode({"status": "success", "subscriptionId": subscription_id})
+        redirect_params = urlencode(
+            {"status": "success", "subscriptionId": local_subscription_id}
+        )
         return RedirectResponse(
-            f"{redirect}{'&' if '?' in redirect else '?'}{params}",
+            f"{redirect}{'&' if '?' in redirect else '?'}{redirect_params}",
             status_code=302,
         )
 
@@ -426,7 +479,7 @@ async def paypal_subscription_return_handler(
             "Error checking PayPal subscription %s: %s", subscription_id, e
         )
         redirect_out = redirect or "/"
-        params = urlencode(
+        redirect_params = urlencode(
             {
                 "status": "error",
                 "subscriptionId": subscription_id or "",
@@ -434,7 +487,7 @@ async def paypal_subscription_return_handler(
             }
         )
         return RedirectResponse(
-            f"{redirect_out}{'&' if '?' in redirect_out else '?'}{params}",
+            f"{redirect_out}{'&' if '?' in redirect_out else '?'}{redirect_params}",
             status_code=302,
         )
 
@@ -445,14 +498,25 @@ async def paypal_subscription_return_handler(
 async def paypal_webhook_subscription_handler(request: Request) -> dict:
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            log_failure(api_logger, "Subscription webhook: body is not a JSON object")
+            body = {}
         event_type = body.get("event_type")
-        resource = body.get("resource", {})
+        resource = body.get("resource")
         log_api_request(
             api_logger,
             "POST",
             "/paypal/webhook/subscription triggered",
             {"event_type": event_type},
         )
+
+        if not event_type:
+            log_failure(api_logger, "Subscription webhook: missing event_type")
+            return {"status": "ignored"}
+
+        if not isinstance(resource, dict) or not resource:
+            log_failure(api_logger, f"Subscription webhook: missing resource for event {event_type}")
+            return {"status": "ignored"}
 
         subscription_id = resource.get("id")
         if not subscription_id:
@@ -464,61 +528,72 @@ async def paypal_webhook_subscription_handler(request: Request) -> dict:
         # -------------------------
         if event_type == "BILLING.SUBSCRIPTION.ACTIVATED":
             # Activate locally using plan duration (start now, end now + subscription_days)
-            sub_row = (
-                supabase.table("subscriptions")
-                .select("id, user_id, plan_id, payment_id")
-                .eq("paypal_subscription_id", subscription_id)
-                .limit(1)
-                .execute()
+            subscription = supabase_get_subscription(
+                {"paypal_subscription_id": subscription_id}
             )
-            if getattr(sub_row, "data", None):
-                sub = sub_row.data[0]
-                plan_days = 30
-                try:
-                    plan_resp = (
-                        supabase.table("membership_plans")
-                        .select("subscription_days")
-                        .eq("id", sub.get("plan_id"))
-                        .limit(1)
-                        .execute()
+            if subscription:
+                plan = supabase_get_membership_plan(
+                    {"id": subscription.get("plan_id")}, columns="subscription_days"
+                )
+                if not plan:
+                    log_failure(
+                        api_logger,
+                        "ACTIVATED webhook: membership plan not found; defaulting plan_days=30",
                     )
-                    if getattr(plan_resp, "data", None):
-                        plan_days = int(
-                            plan_resp.data[0].get("subscription_days") or 30
-                        )
-                except Exception:
-                    api_logger.exception(
-                        "Failed to read plan subscription_days; defaulting to 30"
-                    )
-                adj_start = paypal_compute_adjusted_start(
-                    sub.get("user_id"), sub.get("plan_id"), sub.get("id")
+                    plan_days = 30
+                else:
+                    plan_days = int(plan.get("subscription_days") or 30)
+                adj_start = await paypal_compute_adjusted_start(
+                    subscription.get("user_id"),
+                    subscription.get("plan_id"),
+                    subscription.get("id"),
                 )
                 end_dt = adj_start + timedelta(days=plan_days)
-                supabase.table("subscriptions").update(
+                supabase_mutate_subscription(
+                    "update",
                     {
                         "status": "active",
-                        "start_date": adj_start.isoformat(),
-                        "end_date": end_dt.isoformat(),
-                    }
-                ).eq("id", sub.get("id")).execute()
-
+                        "start_time": adj_start.isoformat(),
+                        "end_time": end_dt.isoformat(),
+                    },
+                    {"id": subscription.get("id")},
+                )
+                api_logger.info(
+                    "Activated subscription %s (user=%s plan=%s) start=%s end=%s",
+                    subscription.get("id"),
+                    subscription.get("user_id"),
+                    subscription.get("plan_id"),
+                    adj_start.isoformat(),
+                    end_dt.isoformat(),
+                )
                 # Ensure a pending payment exists and is linked (webhook fallback)
-                try:
-                    if not sub.get("payment_id"):
-                        plan_amount, plan_currency = (
-                            await paypal_fetch_price_by_subscription_id(subscription_id)
-                        )
-                        await paypal_ensure_linked_pending_payment(
-                            sub_id=sub.get("id"),
-                            user_id=sub.get("user_id"),
-                            gateway_order_id=subscription_id,
-                            amount=plan_amount,
-                            currency=plan_currency,
-                        )
-                except Exception:
-                    api_logger.exception(
-                        "Failed to ensure pending payment on ACTIVATED event"
+                if not subscription.get("payment_id"):
+                    plan_amount, plan_currency = (
+                        await paypal_fetch_price_by_subscription_id(subscription_id)
                     )
+                    inserted_payment = supabase_mutate_payment(
+                        "insert",
+                        {
+                            "user_id": subscription.get("user_id"),
+                            "gateway": "paypal",
+                            "gateway_order_id": subscription_id,
+                            "amount": plan_amount,
+                            "currency": (plan_currency or "USD"),
+                            "status": "pending",
+                        },
+                    )
+                    if getattr(inserted_payment, "data", None):
+                        pid = inserted_payment.data[0].get("id")
+                        supabase_mutate_subscription(
+                            "update",
+                            {"payment_id": pid},
+                            {"id": subscription.get("id")},
+                        )
+                        api_logger.info(
+                            "Webhook ACTIVATED: inserted pending payment %s linked to subscription %s",
+                            pid,
+                            subscription.get("id"),
+                        )
             else:
                 api_logger.warning(
                     f"Subscription {subscription_id} ACTIVATED but not found in DB. Skipping activation."
@@ -528,9 +603,15 @@ async def paypal_webhook_subscription_handler(request: Request) -> dict:
         # Subscription Cancelled
         # -------------------------
         elif event_type == "BILLING.SUBSCRIPTION.CANCELLED":
-            supabase.table("subscriptions").update({"status": "cancelled"}).eq(
-                "paypal_subscription_id", subscription_id
-            ).execute()
+            supabase_mutate_subscription(
+                "update",
+                {"status": "cancelled"},
+                {"paypal_subscription_id": subscription_id},
+            )
+            api_logger.info(
+                "Cancelled local subscription with paypal_subscription_id=%s",
+                subscription_id,
+            )
 
         # -------------------------
         # Payment Completed
@@ -538,123 +619,144 @@ async def paypal_webhook_subscription_handler(request: Request) -> dict:
         elif event_type == "PAYMENT.SALE.COMPLETED":
             paypal_sub_id = resource.get("billing_agreement_id")
             txn_id = resource.get("id")
-            amt_obj = resource.get("amount", {}) or {}
+            amt_obj = resource.get("amount")
+            amount_val = None
+            currency_val = None
+            if isinstance(amt_obj, dict):
+                amount_val = amt_obj.get("total")
+                currency_val = amt_obj.get("currency")
+            else:
+                log_failure(api_logger, "PAYMENT.SALE.COMPLETED: missing amount object in resource")
             if not paypal_sub_id:
                 api_logger.error(
                     "Missing billing_agreement_id in PAYMENT.SALE.COMPLETED"
                 )
             else:
-                sub_res = (
-                    supabase.table("subscriptions")
-                    .select(
-                        "id, user_id, plan_id, status, start_date, end_date, payment_id"
-                    )
-                    .eq("paypal_subscription_id", paypal_sub_id)
-                    .limit(1)
-                    .execute()
+                subscription = supabase_get_subscription(
+                    {"paypal_subscription_id": paypal_sub_id}
                 )
-                if getattr(sub_res, "data", None):
-                    sub = sub_res.data[0]
+                if subscription:
                     # One payment per subscription cycle:
                     # 1) Prefer updating the linked pending payment via subscriptions.payment_id
                     # 2) Else, idempotent upsert by gateway_transaction_id and link it
-                    try:
-                        updated = False
-                        pid = sub.get("payment_id")
-                        if pid:
-                            supabase.table("payments").update(
+                    updated = False
+                    pid = subscription.get("payment_id")
+                    if pid:
+                        supabase_mutate_payment(
+                            "update",
+                            {
+                                "status": "succeeded",
+                                "gateway_transaction_id": txn_id,
+                                "gateway_capture_id": txn_id,
+                                "gateway_order_id": paypal_sub_id,
+                                "amount": amount_val,
+                                "currency": currency_val,
+                            },
+                            {"id": pid},
+                        )
+                        updated = True
+                        api_logger.info(
+                            "Updated linked payment %s as succeeded for subscription %s",
+                            pid,
+                            subscription.get("id"),
+                        )
+                    if not updated:
+                        # Idempotent by gateway_transaction_id
+                        existing_txn_row = supabase_get_payment(
+                            {"gateway_transaction_id": txn_id}
+                        )
+                        if existing_txn_row:
+                            pid = existing_txn_row["id"]
+                            supabase_mutate_payment(
+                                "update",
                                 {
+                                    "user_id": subscription.get("user_id"),
                                     "status": "succeeded",
+                                    "gateway_capture_id": txn_id,
+                                    "gateway_order_id": paypal_sub_id,
+                                    "amount": amount_val,
+                                    "currency": currency_val,
+                                },
+                                {"id": pid},
+                            )
+                            # Link payment to subscription if not linked yet
+                            if not subscription.get("payment_id"):
+                                supabase_mutate_subscription(
+                                    "update",
+                                    {"payment_id": pid},
+                                    {"id": subscription.get("id")},
+                                )
+                                api_logger.info(
+                                    "Linked existing payment %s to subscription %s",
+                                    pid,
+                                    subscription.get("id"),
+                                )
+                            api_logger.info(
+                                "Marked existing payment %s as succeeded for subscription %s",
+                                pid,
+                                subscription.get("id"),
+                            )
+                        else:
+                            inserted_payment = supabase_mutate_payment(
+                                "insert",
+                                {
+                                    "user_id": subscription.get("user_id"),
+                                    "gateway": "paypal",
                                     "gateway_transaction_id": txn_id,
                                     "gateway_capture_id": txn_id,
                                     "gateway_order_id": paypal_sub_id,
-                                    "amount": amt_obj.get("total"),
-                                    "currency": amt_obj.get("currency"),
-                                }
-                            ).eq("id", pid).execute()
-                            updated = True
-                        if not updated:
-                            # Idempotent by gateway_transaction_id
-                            existing_txn = (
-                                supabase.table("payments")
-                                .select("id")
-                                .eq("gateway_transaction_id", txn_id)
-                                .limit(1)
-                                .execute()
+                                    "amount": amount_val,
+                                    "currency": currency_val,
+                                    "status": "succeeded",
+                                },
                             )
-                            if getattr(existing_txn, "data", None):
-                                pid = existing_txn.data[0]["id"]
-                                supabase.table("payments").update(
-                                    {
-                                        "user_id": sub.get("user_id"),
-                                        "status": "succeeded",
-                                        "gateway_capture_id": txn_id,
-                                        "gateway_order_id": paypal_sub_id,
-                                        "amount": amt_obj.get("total"),
-                                        "currency": amt_obj.get("currency"),
-                                    }
-                                ).eq("id", pid).execute()
-                                # Link payment to subscription if not linked yet
-                                if not sub.get("payment_id"):
-                                    supabase.table("subscriptions").update(
-                                        {"payment_id": pid}
-                                    ).eq("id", sub.get("id")).execute()
-                            else:
-                                ins2 = (
-                                    supabase.table("payments")
-                                    .insert(
-                                        {
-                                            "user_id": sub.get("user_id"),
-                                            "gateway": "paypal",
-                                            "gateway_transaction_id": txn_id,
-                                            "gateway_capture_id": txn_id,
-                                            "gateway_order_id": paypal_sub_id,
-                                            "amount": amt_obj.get("total"),
-                                            "currency": amt_obj.get("currency"),
-                                            "status": "succeeded",
-                                        }
-                                    )
-                                    .execute()
+                            if getattr(inserted_payment, "data", None):
+                                new_pid = inserted_payment.data[0].get("id")
+                                supabase_mutate_subscription(
+                                    "update",
+                                    {"payment_id": new_pid},
+                                    {"id": subscription.get("id")},
                                 )
-                                if getattr(ins2, "data", None):
-                                    new_pid = ins2.data[0].get("id")
-                                    supabase.table("subscriptions").update(
-                                        {"payment_id": new_pid}
-                                    ).eq("id", sub.get("id")).execute()
-                    except Exception:
-                        api_logger.exception(
-                            "Failed to upsert succeeded subscription payment"
-                        )
+                                api_logger.info(
+                                    "Inserted succeeded payment %s and linked to subscription %s",
+                                    new_pid,
+                                    subscription.get("id"),
+                                )
 
                     # Ensure subscription is active with correct dates (fallback if ACTIVATED not processed)
-                    try:
-                        if (sub.get("status") or "").lower() != "active":
+                    if (subscription.get("status") or "").lower() != "active":
+                        plan = supabase_get_membership_plan(
+                            {"id": subscription.get("plan_id")},
+                            columns="subscription_days",
+                        )
+                        if not plan:
+                            log_failure(
+                                api_logger,
+                                "PAYMENT.SALE.COMPLETED: membership plan not found; defaulting plan_days=30",
+                            )
                             plan_days = 30
-                            plan_resp = (
-                                supabase.table("membership_plans")
-                                .select("subscription_days")
-                                .eq("id", sub.get("plan_id"))
-                                .limit(1)
-                                .execute()
-                            )
-                            if getattr(plan_resp, "data", None):
-                                plan_days = int(
-                                    plan_resp.data[0].get("subscription_days") or 30
-                                )
-                            adj_start = paypal_compute_adjusted_start(
-                                sub.get("user_id"), sub.get("plan_id"), sub.get("id")
-                            )
-                            end_dt = adj_start + timedelta(days=plan_days)
-                            supabase.table("subscriptions").update(
-                                {
-                                    "status": "active",
-                                    "start_date": adj_start.isoformat(),
-                                    "end_date": end_dt.isoformat(),
-                                }
-                            ).eq("id", sub.get("id")).execute()
-                    except Exception:
-                        api_logger.exception(
-                            "Failed to set subscription active on PAYMENT.SALE.COMPLETED fallback"
+                        else:
+                            plan_days = int(plan.get("subscription_days") or 30)
+                        adj_start = await paypal_compute_adjusted_start(
+                            subscription.get("user_id"),
+                            subscription.get("plan_id"),
+                            subscription.get("id"),
+                        )
+                        end_dt = adj_start + timedelta(days=plan_days)
+                        supabase_mutate_subscription(
+                            "update",
+                            {
+                                "status": "active",
+                                "start_time": adj_start.isoformat(),
+                                "end_time": end_dt.isoformat(),
+                            },
+                            {"id": subscription.get("id")},
+                        )
+                        api_logger.info(
+                            "Fallback ACTIVATION after capture: subscription %s start=%s end=%s",
+                            subscription.get("id"),
+                            adj_start.isoformat(),
+                            end_dt.isoformat(),
                         )
                 else:
                     api_logger.error(
@@ -665,14 +767,16 @@ async def paypal_webhook_subscription_handler(request: Request) -> dict:
         # Subscription Updated
         # -------------------------
         elif event_type == "BILLING.SUBSCRIPTION.UPDATED":
-            supabase.table("subscriptions").update(
+            supabase_mutate_subscription(
+                "update",
                 {
                     "status": resource["status"].lower(),
-                    "end_date": resource.get("billing_info", {}).get(
+                    "end_time": resource.get("billing_info", {}).get(
                         "next_billing_time"
                     ),
-                }
-            ).eq("paypal_subscription_id", subscription_id).execute()
+                },
+                {"paypal_subscription_id": subscription_id},
+            )
 
         api_logger.info(f"Handled PayPal webhook: {event_type} for {subscription_id}")
         return {"status": "ok"}
@@ -710,25 +814,14 @@ async def paypal_order_handler(request: Request, payload: "TransactionPayload"):
     # -------------------------
     # Load Listing Data
     # -------------------------
-    try:
-        listing_resp = (
-            supabase.table("vw_listing_cards")
-            .select("*")
-            .eq("id", listing_id)
-            .execute()
+    listing_card = supabase_get_listing_card({"id": listing_id})
+    if not listing_card:
+        api_logger.error(
+            "Listing not found for listing_id=%s in paypal_order_handler", listing_id
         )
-        if not getattr(listing_resp, "data", None):
-            api_logger.warning("Listing not found: %s", listing_id)
-            raise HTTPException(status_code=404, detail="Listing not found")
-    except HTTPException:
-        # will be logged by safe_handler but also log here for immediate context
-        api_logger.warning("Raising HTTPException for missing listing: %s", listing_id)
-        raise
-    except Exception as e:
-        api_logger.exception("Listing lookup failed: %s", e)
-        raise HTTPException(status_code=500, detail="Listing lookup failed")
+        raise HTTPException(status_code=404, detail="Listing not found")
 
-    listing = listing_resp.data[0]
+    listing = listing_card
     selected_listing_price = (
         listing.get("highest_bid_price", 0)
         if listing.get("listing_type") == "auction"
@@ -738,60 +831,35 @@ async def paypal_order_handler(request: Request, payload: "TransactionPayload"):
     # -------------------------
     # Sold guard: if listing already has a paid order, stop and clean pending ones
     # -------------------------
-    try:
-        sold_statuses = {"awaiting_shipment", "shipped", "delivered", "completed"}
-        orders_res = (
-            supabase.table("orders")
-            .select("id, status")
-            .eq("listing_id", listing_id)
-            .execute()
-        )
-        has_sold = False
-        if getattr(orders_res, "data", None):
-            for row in orders_res.data:
-                st = (row.get("status") or "").lower()
-                if st in sold_statuses:
-                    has_sold = True
-                    break
-        if has_sold:
-            # Remove any stale awaiting_payment orders for this listing
-            try:
-                supabase.table("orders").delete().eq("listing_id", listing_id).eq(
-                    "status", "awaiting_payment"
-                ).execute()
-            except Exception:
-                api_logger.exception(
-                    "Failed to cleanup pending orders for sold listing %s (continuing)",
-                    listing_id,
-                )
-            return {"status": "sold"}
-    except Exception as e:
-        api_logger.exception("Sold guard check failed: %s", e)
-        # Continue flow; better to proceed than hard-fail here
+    sold_statuses = ["awaiting_shipment", "shipped", "delivered", "completed"]
+    sold_order = supabase_get_order(
+        {"listing_id": listing_id, "status": {"in": sold_statuses}}
+    )
+    if sold_order:
+        # Best-effort cleanup of stale awaiting_payment orders (ignore errors)
+        try:
+            supabase_delete_order(
+                {"listing_id": listing_id, "status": "awaiting_payment"}
+            )
+        except Exception:
+            pass
+        return {"status": "sold"}
 
     # -------------------------
     # Load Buyer Currency
     # -------------------------
-    try:
-        buyer_resp = (
-            supabase.table("profiles").select("currency").eq("id", buyer_id).execute()
+    profile_row = supabase_get_profile({"id": buyer_id}, columns="currency")
+    profile_currency = profile_row.get("currency") if profile_row else None
+    if not profile_currency:
+        api_logger.error(
+            "Buyer currency lookup failed for user_id=%s (profile_row=%s)",
+            buyer_id,
+            profile_row,
         )
-        if not getattr(buyer_resp, "data", None) or len(buyer_resp.data) == 0:
-            api_logger.error("Buyer profile not found for id: %s", buyer_id)
-            raise HTTPException(status_code=500, detail="Buyer currency lookup failed")
-        buyer = buyer_resp.data[0]
-        buyer_currency = (
-            buyer.get("currency")
-            or insurance_currency
-            or selected_rate_currency
-            or "USD"
-        ).upper()
-    except HTTPException:
-        # already logged above; re-raise
-        raise
-    except Exception as e:
-        api_logger.exception("Buyer currency lookup failed unexpectedly: %s", e)
         raise HTTPException(status_code=500, detail="Buyer currency lookup failed")
+    buyer_currency = (
+        profile_currency or insurance_currency or selected_rate_currency or "USD"
+    ).upper()
 
     # -------------------------
     # Check for existing pending order (we will UPDATE it instead of returning stale gateway URLs)
@@ -799,311 +867,113 @@ async def paypal_order_handler(request: Request, payload: "TransactionPayload"):
     reuse_order = False
     order_id = None
     old_gateway_order_id = None
-    try:
-        existing_pending = (
-            supabase.table("orders")
-            .select("id, gateway_checkout_url, gateway_order_id, status")
-            .eq("listing_id", listing_id)
-            .eq("buyer_id", buyer_id)
-            .eq("status", "awaiting_payment")
-            .execute()
-        )
-        if getattr(existing_pending, "data", None) and len(existing_pending.data) > 0:
-            existing = existing_pending.data[0]
-            order_id = existing.get("id")
-            old_gateway_order_id = existing.get("gateway_order_id")
-            reuse_order = bool(order_id)
-            api_logger.info(
-                "Reusing existing awaiting_payment order %s for buyer=%s listing=%s (will refresh amounts and PayPal order)",
-                order_id,
-                buyer_id,
-                listing_id,
-            )
-    except Exception as e:
-        api_logger.exception(
-            "Failed to check existing pending orders (non-fatal): %s", e
+    existing_order = supabase_get_order(
+        {
+            "listing_id": listing_id,
+            "buyer_id": buyer_id,
+            "status": "awaiting_payment",
+        }
+    )
+    if existing_order:
+        order_id = existing_order.get("id")
+        old_gateway_order_id = existing_order.get("gateway_order_id")
+        reuse_order = bool(order_id)
+        api_logger.info(
+            "Reusing existing awaiting_payment order %s for buyer=%s listing=%s (will refresh amounts and PayPal order)",
+            order_id,
+            buyer_id,
+            listing_id,
         )
 
     # -------------------------
     # Load and Validate Seller Address (address_from)
     # -------------------------
-    try:
-        seller_id = listing.get("seller_id")
-        if not seller_id:
-            raise HTTPException(
-                status_code=500, detail="Listing missing seller reference"
-            )
-
-        seller_addr_resp = (
-            supabase.table("user_addresses")
-            .select("*")
-            .eq("user_id", seller_id)
-            .execute()
+    seller_id = listing.get("seller_id")
+    if not seller_id:
+        api_logger.error(
+            "Listing %s missing seller reference (seller_id is null)", listing_id
         )
-        if (
-            not getattr(seller_addr_resp, "data", None)
-            or len(seller_addr_resp.data) == 0
-        ):
-            api_logger.warning("No address found for seller %s", seller_id)
-            raise HTTPException(
-                status_code=400, detail="No shipping origin address found for seller"
-            )
-        seller_addr = seller_addr_resp.data[0]
+        raise HTTPException(status_code=500, detail="Listing missing seller reference")
 
-        seller_profile_resp = (
-            supabase.table("profiles")
-            .select("username, email, phone_number")
-            .eq("id", seller_id)
-            .execute()
+    seller_address = supabase_get_user_address({"user_id": seller_id})
+    if not seller_address:
+        api_logger.error(
+            "No shipping origin address found for seller_id=%s (listing_id=%s)",
+            seller_id,
+            listing_id,
         )
-        if (
-            not getattr(seller_profile_resp, "data", None)
-            or len(seller_profile_resp.data) == 0
-        ):
-            api_logger.warning("No seller profile found for %s", seller_id)
-            seller_profile = {}
-        else:
-            seller_profile = seller_profile_resp.data[0]
+        raise HTTPException(
+            status_code=400, detail="No shipping origin address found for seller"
+        )
 
-        seller_address = {
-            "name": (seller_profile.get("username") or "").strip() or "Seller",
-            "street1": seller_addr.get("address_line_1", ""),
-            "street2": seller_addr.get("address_line_2", "") or "",
-            "city": seller_addr.get("city", ""),
-            "state": seller_addr.get("state_province", ""),
-            "zip": seller_addr.get("postal_code", ""),
-            "country": (seller_addr.get("country", "") or "").upper(),
-            "phone": seller_profile.get("phone_number") or None,
-            "email": seller_profile.get("email") or None,
-        }
+    seller_profile = supabase_get_profile(
+        {"id": seller_id}, columns="username,email,phone_number"
+    )
+    if not seller_profile:
+        api_logger.error(
+            "Seller profile not found for seller_id=%s (listing_id=%s)",
+            seller_id,
+            listing_id,
+        )
+        raise HTTPException(status_code=500, detail="Seller profile lookup failed")
 
-        # Validate and normalize seller address
-        try:
-            seller_validated = await shippo_validate_address(seller_address)
-        except HTTPException:
-            raise
-        except Exception as e:
-            api_logger.exception("Shippo seller address validation failed: %s", e)
-            raise HTTPException(
-                status_code=500, detail="Unable to validate seller address"
-            )
+    seller_address = {
+        "name": (seller_profile.get("username") or "").strip() or "Seller",
+        "street1": seller_address.get("address_line_1", ""),
+        "street2": seller_address.get("address_line_2", "") or "",
+        "city": seller_address.get("city", ""),
+        "state": seller_address.get("state_province", ""),
+        "zip": seller_address.get("postal_code", ""),
+        "country": (seller_address.get("country", "") or "").upper(),
+        "phone": seller_profile.get("phone_number") or None,
+        "email": seller_profile.get("email") or None,
+    }
 
-        try:
-            vrd = (
-                getattr(seller_validated, "validation_results", None)
-                if not isinstance(seller_validated, dict)
-                else seller_validated.get("validation_results")
-            )
-            if vrd and not (
-                vrd.get("is_valid")
-                if isinstance(vrd, dict)
-                else getattr(vrd, "is_valid", False)
-            ):
-                msgs = (
-                    vrd.get("messages", [])
-                    if isinstance(vrd, dict)
-                    else getattr(vrd, "messages", [])
-                )
-                short_msgs = (
-                    [getattr(m, "text", str(m)) for m in msgs][:3] if msgs else []
-                )
-                raise HTTPException(
-                    status_code=400,
-                    detail={"error": "Invalid origin address", "messages": short_msgs},
-                )
-
-            # Accept normalized fields if present
-            def _gf(obj, field):
-                if not obj:
-                    return None
-                if isinstance(obj, dict):
-                    return obj.get(field)
-                return getattr(obj, field, None)
-
-            norm_street1 = _gf(seller_validated, "street1")
-            if norm_street1:
-                seller_address.update(
-                    {
-                        "street1": norm_street1,
-                        "street2": _gf(seller_validated, "street2")
-                        or seller_address.get("street2", ""),
-                        "city": _gf(seller_validated, "city")
-                        or seller_address.get("city", ""),
-                        "state": _gf(seller_validated, "state")
-                        or seller_address.get("state", ""),
-                        "zip": _gf(seller_validated, "zip")
-                        or seller_address.get("zip", ""),
-                        "country": _gf(seller_validated, "country")
-                        or seller_address.get("country", ""),
-                        "object_id": _gf(seller_validated, "object_id")
-                        or seller_address.get("object_id"),
-                        "validation_results": {"is_valid": True},
-                    }
-                )
-        except HTTPException:
-            raise
-        except Exception as e:
-            api_logger.exception(
-                "Unexpected issue inspecting validated seller address: %s", e
-            )
-            raise HTTPException(
-                status_code=500, detail="Error processing seller address"
-            )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        api_logger.exception("Seller address processing failed: %s", e)
-        raise HTTPException(status_code=500, detail="Error processing seller address")
+    # Validate and normalize seller address (merged helper)
+    seller_address = await shippo_validate_and_merge(seller_address)
 
     # -------------------------
     # Load and Validate Buyer Address
     # -------------------------
-    try:
-        buyer_address_resp = (
-            supabase.table("user_addresses")
-            .select("*")
-            .eq("user_id", buyer_id)
-            .execute()
+    buyer_address = supabase_get_user_address({"user_id": buyer_id})
+    if not buyer_address:
+        api_logger.error(
+            "No shipping destination address found for buyer_id=%s (listing_id=%s)",
+            buyer_id,
+            listing_id,
         )
-        if (
-            not getattr(buyer_address_resp, "data", None)
-            or len(buyer_address_resp.data) == 0
-        ):
-            api_logger.warning("No address found for buyer %s", buyer_id)
-            raise HTTPException(
-                status_code=400, detail="No shipping address found for buyer"
-            )
-        buyer_address = buyer_address_resp.data[0]
-
-        # Get buyer profile for name, phone, email (since user_addresses table only has address fields)
-        buyer_profile_resp = (
-            supabase.table("profiles")
-            .select("username, email, phone_number")
-            .eq("id", buyer_id)
-            .execute()
+        raise HTTPException(
+            status_code=400, detail="No shipping destination address found"
         )
-        if (
-            not getattr(buyer_profile_resp, "data", None)
-            or len(buyer_profile_resp.data) == 0
-        ):
-            api_logger.warning("No buyer profile found for %s", buyer_id)
-            buyer_profile = {}
-        else:
-            buyer_profile = buyer_profile_resp.data[0]
 
-        # Build shipping payload including street2, phone, email to improve Shippo match accuracy
-        buyer_name = buyer_profile.get("username", "")
-        shipping_address = {
-            "name": buyer_name or "Buyer",
-            "street1": buyer_address.get("address_line_1", ""),
-            "street2": buyer_address.get("address_line_2", "") or "",
-            "city": buyer_address.get("city", ""),
-            "state": buyer_address.get("state_province", ""),
-            "zip": buyer_address.get("postal_code", ""),
-            "country": buyer_address.get("country", ""),
-            "phone": buyer_profile.get("phone_number") or None,
-            "email": buyer_profile.get("email") or None,
-        }
+    # Get buyer profile for name, phone, email (since user_addresses table only has address fields)
+    buyer_profile = supabase_get_profile(
+        {"id": buyer_id}, columns="username,email,phone_number"
+    )
+    if not buyer_profile:
+        api_logger.error(
+            "Buyer profile not found for buyer_id=%s (listing_id=%s)",
+            buyer_id,
+            listing_id,
+        )
+        raise HTTPException(status_code=500, detail="Buyer profile lookup failed")
 
-        # Validate address with Shippo
-        try:
-            validated_address = await shippo_validate_address(shipping_address)
-        except HTTPException:
-            # Re-raise HTTP exceptions from address validation
-            raise
-        except Exception as e:
-            # Log and handle other validation failures
-            api_logger.exception("Shippo address validation call failed: %s", e)
-            raise HTTPException(
-                status_code=500,
-                detail="Unable to validate shipping address. Please check the address and try again.",
-            )
+    # Build shipping payload including street2, phone, email to improve Shippo match accuracy
+    buyer_name = buyer_profile.get("username", "")
+    shipping_address = {
+        "name": buyer_name or "Buyer",
+        "street1": buyer_address.get("address_line_1", ""),
+        "street2": buyer_address.get("address_line_2", "") or "",
+        "city": buyer_address.get("city", ""),
+        "state": buyer_address.get("state_province", ""),
+        "zip": buyer_address.get("postal_code", ""),
+        "country": buyer_address.get("country", ""),
+        "phone": buyer_profile.get("phone_number") or None,
+        "email": buyer_profile.get("email") or None,
+    }
 
-        # Inspect validation results defensively
-        try:
-            is_address_valid = False
-            vr = getattr(validated_address, "validation_results", None)
-            if vr is not None:
-                is_address_valid = bool(getattr(vr, "is_valid", False))
-                messages = getattr(vr, "messages", []) or []
-                if not is_address_valid:
-                    short_msgs = [getattr(m, "text", str(m)) for m in messages][:3]
-                    api_logger.warning(
-                        "Shippo returned invalid address for buyer %s: %s",
-                        buyer_id,
-                        short_msgs,
-                    )
-                    raise HTTPException(
-                        status_code=400,
-                        detail={"error": "Invalid address", "messages": short_msgs},
-                    )
-            else:
-                # dict-like handling if helper returns dict
-                vrd = (
-                    validated_address.get("validation_results")
-                    if isinstance(validated_address, dict)
-                    else None
-                )
-                if vrd:
-                    is_address_valid = bool(vrd.get("is_valid"))
-                    if not is_address_valid:
-                        msgs = vrd.get("messages", [])
-                        short_msgs = [m.get("text", str(m)) for m in msgs][:3]
-                        api_logger.warning(
-                            "Shippo invalid address for buyer %s: %s",
-                            buyer_id,
-                            short_msgs,
-                        )
-                        raise HTTPException(
-                            status_code=400,
-                            detail={"error": "Invalid address", "messages": short_msgs},
-                        )
-                else:
-                    # assume ok if no validation metadata
-                    is_address_valid = True
-
-            # Accept normalized fields if present
-            def _get_field(obj, field):
-                if not obj:
-                    return None
-                if isinstance(obj, dict):
-                    return obj.get(field)
-                return getattr(obj, field, None)
-
-            normalized_street1 = _get_field(validated_address, "street1")
-            if normalized_street1:
-                shipping_address.update(
-                    {
-                        "street1": normalized_street1,
-                        "street2": _get_field(validated_address, "street2")
-                        or shipping_address.get("street2", ""),
-                        "city": _get_field(validated_address, "city")
-                        or shipping_address.get("city", ""),
-                        "state": _get_field(validated_address, "state")
-                        or shipping_address.get("state", ""),
-                        "zip": _get_field(validated_address, "zip")
-                        or shipping_address.get("zip", ""),
-                        "country": _get_field(validated_address, "country")
-                        or shipping_address.get("country", ""),
-                        "validation_results": {"is_valid": True},
-                    }
-                )
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            api_logger.exception("Unexpected issue inspecting validated address: %s", e)
-            raise HTTPException(
-                status_code=500, detail="Error processing validated address"
-            )
-
-    except HTTPException:
-        # re-raise; safe_handler will log it too
-        raise
-    except Exception as e:
-        api_logger.exception("Buyer address processing failed: %s", e)
-        raise HTTPException(status_code=500, detail="Error processing shipping address")
+    # Validate and normalize buyer address (merged helper)
+    shipping_address = await shippo_validate_and_merge(shipping_address)
 
     # -------------------------
     # Build server-side shipment and select canonical Shippo rate
@@ -1212,7 +1082,7 @@ async def paypal_order_handler(request: Request, payload: "TransactionPayload"):
                 "shipping_address": shipping_address,
                 "shipping_rate_id": canonical_rate_id,
             }
-            supabase.table("orders").update(update_fields).eq("id", order_id).execute()
+            supabase_mutate_order("update", update_fields, {"id": order_id})
         else:
             order_data = {
                 "listing_id": listing_id,
@@ -1227,7 +1097,7 @@ async def paypal_order_handler(request: Request, payload: "TransactionPayload"):
                 "shipping_address": shipping_address,
                 "shipping_rate_id": canonical_rate_id,
             }
-            insert_resp = supabase.table("orders").insert(order_data).execute()
+            insert_resp = supabase_mutate_order("insert", order_data)
             if not getattr(insert_resp, "data", None) or len(insert_resp.data) == 0:
                 api_logger.error("DB insert returned empty for order creation")
                 raise HTTPException(status_code=500, detail="Database insert failed")
@@ -1251,12 +1121,12 @@ async def paypal_order_handler(request: Request, payload: "TransactionPayload"):
         # Best-effort: when reusing order, void previous PayPal order id to avoid stale unpaid orders
         if reuse_order and old_gateway_order_id:
             try:
+                await paypal_void_checkout(old_gateway_order_id)
                 api_logger.info(
                     "Voiding previous PayPal order id %s for reused order %s",
                     old_gateway_order_id,
                     order_id,
                 )
-                await paypal_void_checkout(old_gateway_order_id)
             except Exception as ve:
                 api_logger.exception(
                     "Failed to void previous PayPal order %s (continuing): %s",
@@ -1264,7 +1134,7 @@ async def paypal_order_handler(request: Request, payload: "TransactionPayload"):
                     ve,
                 )
 
-        base = get_base_url(request)
+        base = paypal_get_base_url(request)
         return_url = (
             f"{base}/api/v1/paypal/order/return?{urlencode({'redirect': redirect})}"
         )
@@ -1277,39 +1147,20 @@ async def paypal_order_handler(request: Request, payload: "TransactionPayload"):
         if insurance_fee and Decimal(str(insurance_fee)) > 0:
             amount_breakdown["handling"] = f"{insurance_fee}"
 
-        try:
-            # Prefer cards.canonical_title via card_id, then view's title, then name
-            canonical_title = None
-            try:
-                card_id_from_listing = listing.get("card_id")
-                if card_id_from_listing:
-                    resp_card = (
-                        supabase.table("cards")
-                        .select("canonical_title")
-                        .eq("id", card_id_from_listing)
-                        .limit(1)
-                        .execute()
-                    )
-                    if getattr(resp_card, "data", None):
-                        canonical_title = (resp_card.data[0] or {}).get(
-                            "canonical_title"
-                        )
-            except Exception:
-                api_logger.exception(
-                    "Failed to fetch canonical_title for card_id %s", listing.get("card_id")
+        # Prefer cards.canonical_title via card_id, then view's title, then name
+        card_id_from_listing = listing.get("card_id")
+        item_name = None
+        if card_id_from_listing:
+            card = supabase_get_card(
+                {"id": card_id_from_listing}, columns="canonical_title"
+            )
+            if card:
+                item_name = card.get("canonical_title")
+            else:
+                api_logger.error("Card not found for card_id %s", card_id_from_listing)
+                raise HTTPException(
+                    status_code=500, detail="Card not found for card_id"
                 )
-
-            item_name = (
-                (canonical_title or "").strip()
-                or (listing.get("title") or "").strip()
-                or (listing.get("name") or "").strip()
-                or "Unknown Card"
-            )
-        except Exception:
-            api_logger.exception(
-                "Failed to read item name from listing; falling back to Unknown Card"
-            )
-            item_name = "Unknown Card"
 
         item_unit_amount = (
             Decimal(amount_breakdown["item_total"])
@@ -1341,22 +1192,19 @@ async def paypal_order_handler(request: Request, payload: "TransactionPayload"):
         )
 
         # Update order with PayPal data (checkout url + id) — always overwrite to refresh stale links
-        update_resp = (
-            supabase.table("orders")
-            .update(
-                {
-                    "gateway_order_id": paypal_resp["paypal_order_id"],
-                    "gateway_checkout_url": paypal_resp["paypal_checkout_url"],
-                }
-            )
-            .eq("id", order_id)
-            .execute()
+        update_resp = supabase_mutate_order(
+            "update",
+            {
+                "gateway_order_id": paypal_resp["paypal_order_id"],
+                "gateway_checkout_url": paypal_resp["paypal_checkout_url"],
+            },
+            {"id": order_id},
         )
         if not getattr(update_resp, "data", None) or len(update_resp.data) == 0:
             api_logger.error("Order update returned no data for order %s", order_id)
             # best-effort cleanup
             try:
-                supabase.table("orders").delete().eq("id", order_id).execute()
+                supabase_delete_order({"id": order_id})
                 api_logger.info(
                     "Deleted order %s after gateway update failure", order_id
                 )
@@ -1377,8 +1225,8 @@ async def paypal_order_handler(request: Request, payload: "TransactionPayload"):
         # Clean up order if it was created
         if "order_id" in locals():
             try:
-                supabase.table("orders").delete().eq("id", order_id).execute()
-                api_logger.info("Cleaned up order %s after PayPal HTTP error", order_id)
+                supabase_delete_order({"id": order_id})
+                api_logger.info("Deleted order %s after PayPal HTTP error", order_id)
             except Exception:
                 api_logger.exception("Failed to clean up order after PayPal HTTP error")
         raise
@@ -1389,13 +1237,13 @@ async def paypal_order_handler(request: Request, payload: "TransactionPayload"):
         # Clean up order if it was created
         if "order_id" in locals():
             try:
-                supabase.table("orders").delete().eq("id", order_id).execute()
-                api_logger.info("Cleaned up order %s after PayPal error", order_id)
+                supabase_delete_order({"id": order_id})
+                api_logger.info("Deleted order %s after PayPal error", order_id)
             except Exception:
                 api_logger.exception("Failed to clean up order after PayPal error")
         raise HTTPException(status_code=500, detail="Create paypal approve url error")
 
-    api_logger.info("Created order %s awaiting payment, checkout_url stored", order_id)
+    log_success(api_logger, f"Created order {order_id} awaiting payment; checkout_url stored")
     return paypal_resp
 
 
@@ -1411,14 +1259,14 @@ async def paypal_order_return_handler(
     try:
         params = {}
         if request is not None:
-            try:
-                params = dict(request.query_params)
-            except Exception:
-                params = {}
+            params = dict(request.query_params)
 
         merged = {}
         merged.update(params)
         merged.update(kwargs)
+        api_logger.debug(
+            "paypal_order_return_handler: params=%s kwargs=%s", params, kwargs
+        )
 
         redirect_from_req = (
             merged.get("redirect")
@@ -1440,58 +1288,51 @@ async def paypal_order_return_handler(
             redirect if redirect is not None else (redirect_from_req or "/")
         )
         final_token = token if token is not None else token_from_req
+        api_logger.info(
+            "Return handler resolved redirect=%s token=%s", final_redirect, final_token
+        )
 
         # If the user returned with a PayPal order token, ensure there's a pending payment row now
-        try:
-            if final_token:
-                # Load the order by gateway_order_id
-                order_resp = (
-                    supabase.table("orders")
-                    .select("id, buyer_id, final_price, currency, status")
-                    .eq("gateway_order_id", final_token)
-                    .limit(1)
-                    .execute()
+        if final_token:
+            # Load the order by gateway_order_id
+            order_row = supabase_get_order({"gateway_order_id": final_token})
+            if not order_row:
+                log_failure(
+                    api_logger,
+                    f"Order not found for gateway_order_id {final_token} on return",
                 )
-                if getattr(order_resp, "data", None):
-                    order_row = order_resp.data[0]
-                    if (order_row.get("status") or "").lower() == "awaiting_payment":
-                        # Check if a payment already exists
-                        pay_check = (
-                            supabase.table("payments")
-                            .select("id")
-                            .eq("order_id", order_row.get("id"))
-                            .limit(1)
-                            .execute()
+            else:
+                order_status = (order_row.get("status") or "").lower()
+                order_id_val = order_row.get("id")
+                if order_status == "awaiting_payment":
+                    # Check if a payment already exists for this order
+                    existing_payment = supabase_get_payment({"order_id": order_id_val})
+                    if existing_payment:
+                        api_logger.info(
+                            "Pending payment already exists on return for order %s",
+                            order_id_val,
                         )
-                        if not getattr(pay_check, "data", None):
-                            # Insert a pending payment record tied to this PayPal order
-                            try:
-                                supabase.table("payments").insert(
-                                    {
-                                        "order_id": order_row.get("id"),
-                                        "user_id": order_row.get("buyer_id"),
-                                        "gateway": "paypal",
-                                        "gateway_order_id": final_token,
-                                        "amount": order_row.get("final_price"),
-                                        "currency": (
-                                            order_row.get("currency") or "USD"
-                                        ).upper(),
-                                        "status": "pending",
-                                    }
-                                ).execute()
-                                api_logger.info(
-                                    "Inserted pending payment on return for order %s",
-                                    order_row.get("id"),
-                                )
-                            except Exception:
-                                api_logger.exception(
-                                    "Failed to insert pending payment on return for order %s",
-                                    order_row.get("id"),
-                                )
-        except Exception:
-            api_logger.exception(
-                "Return handler: best-effort pending payment insert failed"
-            )
+                    else:
+                        # Insert a pending payment record tied to this PayPal order
+                        supabase_mutate_payment(
+                            "insert",
+                            {
+                                "order_id": order_id_val,
+                                "user_id": order_row.get("buyer_id"),
+                                "gateway": "paypal",
+                                "gateway_order_id": final_token,
+                                "amount": order_row.get("final_price"),
+                                "currency": (order_row.get("currency") or "USD").upper(),
+                                "status": "pending",
+                            },
+                        )
+                        log_success(api_logger, f"Inserted pending payment on return for order {order_id_val}")
+                else:
+                    api_logger.info(
+                        "Order %s status is %s — skipping pending payment insert on return",
+                        order_id_val,
+                        order_status,
+                    )
 
         status = "success" if final_token else "cancel"
         return_params = {"status": status, "orderId": final_token or ""}
@@ -1515,6 +1356,79 @@ async def paypal_order_return_handler(
 # ===============================================================
 # /paypal/webhook/order
 # ===============================================================
+"""
+PayPal Orders + Payments + Shippo — Webhook Flow (authoritative summary)
+
+Events handled
+- CHECKOUT.ORDER.APPROVED (Orders v2)
+  For AUTHORIZE intent we do, in order:
+  1) Ensure a pending payment row exists (idempotent)
+  2) Authorize the PayPal order → authorization_id
+  3) Capture the authorization → capture_id
+  4) Finalize locally (create Shippo label, mark payment succeeded, set order to awaiting_shipment, cancel siblings)
+  The capture webhook below is also accepted as a backup if immediate finalize fails.
+
+- CHECKOUT.ORDER.COMPLETED (Orders v2)
+  Some gateways emit COMPLETED in Orders v2; we mirror the same APPROVED flow (ensure pending → authorize → capture → finalize). All steps are idempotent.
+
+- PAYMENT.CAPTURE.COMPLETED (Payments v2)
+  PayPal confirms a capture. We finalize locally using only the capture id (idempotent) as a safety net.
+
+Supabase data contract (public.orders)
+- Insert at checkout creation (outside webhook):
+  - id (uuid), listing_id (uuid), buyer_id (uuid), seller_id (uuid)
+  - currency (varchar), final_price (numeric), seller_earnings (numeric)
+  - shipping_fee (numeric, nullable), insurance_fee (numeric, nullable)
+  - status = 'awaiting_payment'
+  - shipping_address (jsonb)
+  - shipping_rate_id (varchar, selected server-side during checkout)
+  - gateway_order_id (text), gateway_checkout_url (text)
+  - created_at (timestamptz auto)
+
+- Updated during webhook finalize-after-capture (success path):
+  - status → 'awaiting_shipment'
+  - paid_at → now()
+  - shipping_transaction_id (text) from Shippo
+  - shipping_tracking_number (varchar) from Shippo
+  - shipping_tracking_url (text) from Shippo
+  - shipping_label_url (text) from Shippo
+  - gateway_authorization_id (text) → set if we have it in the flow
+
+- Updated during webhook on shipping failure (Shippo buy label failed):
+  - status → 'cancelled'
+  - order_failed_info (text) → first Shippo error message or exception text
+
+Supabase data contract (public.payments)
+- Insert pending (idempotent) in APPROVED/COMPLETED branch if none exists yet:
+  - order_id (uuid), user_id (uuid → buyer_id)
+  - gateway = 'paypal'
+  - gateway_order_id (text)
+  - gateway_transaction_id (text) → any txn id present in the webhook resource (auth or capture)
+  - gateway_account_info (jsonb) → payer email and optional card tail/brand when available
+  - amount (numeric) → orders.final_price
+  - currency (text) → orders.currency
+  - status = 'pending'
+
+- Update to succeeded during finalize-after-capture (success path):
+  - status → 'succeeded'
+  - gateway_transaction_id → capture_id
+  - gateway_capture_id → capture_id
+
+- Update to failed/cancelled on error/competition:
+  - If Shippo failed: status → 'failed' for the payment(s) of this order
+  - If sibling orders cancelled (same listing): status → 'cancelled' for those orders' payments
+
+Idempotency and short-circuit
+- Before processing, if any payment for the order already has status = 'succeeded', the handler returns early.
+- Finalization can be triggered either immediately (after capture) or by the capture webhook; both paths are idempotent.
+
+Notes
+- We currently set orders.gateway_authorization_id during finalize-after-capture when available. This avoids extra writes during APPROVED; behavior is safe and idempotent. If needed, we can set it immediately after authorization as a future enhancement.
+- We rely on orders.shipping_rate_id captured at checkout creation; finalize will fail (400) if it's missing.
+- All DB mutations are funneled through small helpers: paypal_mutate_* and paypal_order_*.
+"""
+
+
 async def paypal_webhook_order_handler(request: Request) -> dict:
     log_api_request(
         api_logger, "POST", "/paypal/webhook/order", {"headers": dict(request.headers)}
@@ -1530,11 +1444,14 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
         event_type = body.get("event_type")
         api_logger.info("PayPal webhook event_type: %s", event_type)
 
-        # ---- handle approval events (Orders v2) ----
-        # Valid Orders events include CHECKOUT.ORDER.APPROVED and CHECKOUT.ORDER.COMPLETED.
-        # There is no CHECKOUT.ORDER.AUTHORIZED in Orders v2 webhooks.
-        if event_type in ("CHECKOUT.ORDER.APPROVED",):
-            resource = body.get("resource", {}) or {}
+        # ----------------------------------------------------------
+        # CHECKOUT.ORDER.APPROVED — ensure pending payment (idempotent)
+        # ----------------------------------------------------------
+        if event_type == "CHECKOUT.ORDER.APPROVED":
+            resource = body.get("resource")
+            if not isinstance(resource, dict):
+                log_failure(api_logger, "Webhook APPROVED: missing resource body")
+                return {"status": "ignored"}
             paypal_order_id = resource.get("id") or resource.get("order_id")
             if not paypal_order_id:
                 api_logger.error("Webhook approval event missing order id")
@@ -1546,7 +1463,8 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
             try:
                 pu = resource.get("purchase_units") or []
                 if pu:
-                    payments = pu[0].get("payments") or {}
+                    payments = pu[0].get("payments") if isinstance(pu[0], dict) else None
+                    payments = payments if isinstance(payments, dict) else {}
                     captures = payments.get("captures") or []
                     if captures and captures[0]:
                         paypal_txn_id = captures[0].get("id")
@@ -1554,16 +1472,20 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                         auths = payments.get("authorizations") or []
                         if auths and auths[0]:
                             paypal_txn_id = auths[0].get("id")
+                payer = resource.get("payer")
+                if isinstance(payer, dict):
+                    payer_info = payer.get("payer_info")
+                    email = payer.get("email_address")
+                    if not email and isinstance(payer_info, dict):
+                        email = payer_info.get("email")
+                    if email:
+                        gateway_account_info["email"] = email
+                else:
+                    log_failure(api_logger, "Webhook APPROVED: missing payer info in resource")
 
-                payer = resource.get("payer") or {}
-                email = payer.get("email_address") or (
-                    payer.get("payer_info", {}) or {}
-                ).get("email")
-                if email:
-                    gateway_account_info["email"] = email
-
-                card = (resource.get("payment_source") or {}).get("card") or {}
-                if card:
+                payment_source = resource.get("payment_source")
+                card = payment_source.get("card") if isinstance(payment_source, dict) else None
+                if isinstance(card, dict):
                     cc = {}
                     last4 = (
                         card.get("last_digits")
@@ -1590,23 +1512,15 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
 
             # load order
             try:
-                order_resp = (
-                    supabase.table("orders")
-                    .select(
-                        "id, listing_id, buyer_id, shipping_rate_id, shipping_transaction_id, final_price, currency, status, shipping_address"
-                    )
-                    .eq("gateway_order_id", paypal_order_id)
-                    .execute()
+                order = supabase_get_order(
+                    {"gateway_order_id": paypal_order_id},
+                    columns="id, listing_id, buyer_id, shipping_rate_id, shipping_transaction_id, final_price, currency, status, shipping_address",
                 )
-                api_logger.debug(
-                    "orders.select resp: %s", getattr(order_resp, "data", None)
-                )
-                if not getattr(order_resp, "data", None):
+                if not order:
                     api_logger.error(
                         "Order not found for gateway_order_id %s", paypal_order_id
                     )
                     return {"status": "ok"}
-                order = order_resp.data[0]
             except Exception as e:
                 api_logger.exception(
                     "DB error fetching order for gateway_order_id %s: %s",
@@ -1622,22 +1536,12 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
             # Step 1: idempotency check — skip only if an existing payment is already succeeded
             payments_row = None
             try:
-                payments_check = (
-                    supabase.table("payments")
-                    .select("id, status")
-                    .eq("order_id", order_id)
-                    .execute()
+                payments_list = supabase_get_payments(
+                    {"order_id": order_id}, columns="id,status"
                 )
-                api_logger.debug(
-                    "payments.check resp: %s", getattr(payments_check, "data", None)
-                )
-                if (
-                    getattr(payments_check, "data", None)
-                    and len(payments_check.data) > 0
-                ):
-                    # If any succeeded, short-circuit; otherwise keep a reference and continue to process
+                if payments_list:
                     statuses = [
-                        (row.get("status") or "").lower() for row in payments_check.data
+                        (row.get("status") or "").lower() for row in payments_list
                     ]
                     if any(s == "succeeded" for s in statuses):
                         api_logger.info(
@@ -1645,7 +1549,7 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                             order_id,
                         )
                         return {"status": "ok"}
-                    payments_row = payments_check.data[0]
+                    payments_row = payments_list[0]
             except Exception as e:
                 api_logger.exception(
                     "Failed to check existing payments for order %s: %s", order_id, e
@@ -1663,10 +1567,29 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                 )
                 return {"status": "ok"}
 
+            # If a pending payment already exists, enrich it with gateway_account_info (email/card)
+            try:
+                if payments_row is not None and gateway_account_info:
+                    supabase_mutate_payment(
+                        "update",
+                        {"gateway_account_info": gateway_account_info},
+                        {"order_id": order_id, "status": "pending"},
+                    )
+                    api_logger.info(
+                        "Updated gateway_account_info for pending payment on order %s",
+                        order_id,
+                    )
+            except Exception:
+                api_logger.exception(
+                    "Failed to update gateway_account_info for pending payment on order %s",
+                    order_id,
+                )
+
             # Ensure a pending payment exists (webhook fallback for out-of-order events)
             try:
                 if payments_row is None:
-                    supabase.table("payments").insert(
+                    supabase_mutate_payment(
+                        "insert",
                         {
                             "order_id": order_id,
                             "user_id": order.get("buyer_id"),
@@ -1675,10 +1598,10 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                             "gateway_transaction_id": paypal_txn_id,
                             "amount": order.get("final_price"),
                             "currency": (order.get("currency") or "USD").upper(),
-                            "gateway_account_info": gateway_account_info or None,
+                            "gateway_account_info": gateway_account_info,
                             "status": "pending",
-                        }
-                    ).execute()
+                        },
+                    )
                     api_logger.info(
                         "Inserted pending payment via webhook fallback for order %s",
                         order_id,
@@ -1689,19 +1612,97 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                     order_id,
                 )
 
+            # Attempt to move funds forward: authorize then capture to trigger capture webhook
+            try:
+                auth_resp = await paypal_authorize_order(paypal_order_id)
+                # Extract authorization ids
+                auth_ids: list[str] = []
+                try:
+                    pus = auth_resp.get("purchase_units")
+                    if pus is None:
+                        log_failure(api_logger, "Authorize response missing purchase_units")
+                        return {"status": "ignored"}
+                    if not isinstance(pus, list):
+                        pus = [pus]
+                    for pu in pus:
+                        if not isinstance(pu, dict):
+                            continue
+                        payments = pu.get("payments")
+                        if payments is None:
+                            log_failure(api_logger, "Authorize response missing payments in purchase_units")
+                            return {"status": "ignored"}
+                        if not isinstance(payments, dict):
+                            payments = {}
+                        auths = payments.get("authorizations")
+                        if auths is None:
+                            auths = []
+                        for a in auths:
+                            if isinstance(a, dict):
+                                aid = a.get("id")
+                                if aid:
+                                    auth_ids.append(aid)
+                except Exception:
+                    # Non-fatal parse issue
+                    pass
+                if auth_ids:
+                    for aid in auth_ids:
+                        try:
+                            cap_resp = await paypal_capture_authorization(aid)
+                            cap_id = cap_resp.get("id") if isinstance(cap_resp, dict) else None
+                            api_logger.info(
+                                "Triggered capture for authorization %s (capture id: %s)",
+                                aid,
+                                cap_id,
+                            )
+                        except httpx.HTTPStatusError as he:
+                            api_logger.error(
+                                "Capture failed for authorization %s: %s",
+                                aid,
+                                getattr(he.response, "text", str(he)),
+                            )
+                        except Exception:
+                            api_logger.exception(
+                                "Unexpected error capturing authorization %s",
+                                aid,
+                            )
+                else:
+                    api_logger.info(
+                        "No authorization ids found in authorize response for order %s",
+                        paypal_order_id,
+                    )
+            except httpx.HTTPStatusError as he:
+                api_logger.error(
+                    "Authorize call failed on APPROVED webhook for order %s: %s",
+                    paypal_order_id,
+                    getattr(he.response, "text", str(he)),
+                )
+            except Exception:
+                api_logger.exception(
+                    "Unexpected error while authorizing/capturing for order %s",
+                    paypal_order_id,
+                )
+
             # Early exit on APPROVED: do not finalize here; wait for PAYMENT.CAPTURE.COMPLETED
             return {"status": "ok"}
 
-        # ---- finalize on payment capture completed (Payments v2) ----
+        # ----------------------------------------------------------
+        # PAYMENT.CAPTURE.COMPLETED — finalize on payment capture completed (Payments v2) (idempotent)
+        # ----------------------------------------------------------
         if event_type == "PAYMENT.CAPTURE.COMPLETED":
-            resource = body.get("resource", {}) or {}
+            resource = body.get("resource")
+            if not isinstance(resource, dict):
+                log_failure(api_logger, "Capture webhook: missing resource body")
+                return {"status": "ignored"}
             # Resolve order id from capture resource
             capture_id = resource.get("id")
-            related = (resource.get("supplementary_data", {}) or {}).get(
-                "related_ids", {}
+            supplementary_data = resource.get("supplementary_data")
+            related_ids = (
+                supplementary_data.get("related_ids")
+                if isinstance(supplementary_data, dict)
+                else None
             )
-            paypal_order_id = related.get("order_id")
-            related_auth_id = related.get("authorization_id")
+            paypal_order_id = related_ids.get("order_id") if isinstance(related_ids, dict) else None
+            related_auth_id = related_ids.get("authorization_id") if isinstance(related_ids, dict) else None
             if not paypal_order_id:
                 try:
                     for l in resource.get("links", []) or []:
@@ -1723,23 +1724,15 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
 
             # load order
             try:
-                order_resp = (
-                    supabase.table("orders")
-                    .select(
-                        "id, listing_id, buyer_id, shipping_rate_id, shipping_transaction_id, final_price, currency, status, shipping_address"
-                    )
-                    .eq("gateway_order_id", paypal_order_id)
-                    .execute()
+                order = supabase_get_order(
+                    {"gateway_order_id": paypal_order_id},
+                    columns="id, listing_id, buyer_id, shipping_rate_id, shipping_transaction_id, final_price, currency, status, shipping_address",
                 )
-                api_logger.debug(
-                    "orders.select resp: %s", getattr(order_resp, "data", None)
-                )
-                if not getattr(order_resp, "data", None):
+                if not order:
                     api_logger.error(
                         "Order not found for gateway_order_id %s", paypal_order_id
                     )
                     return {"status": "ok"}
-                order = order_resp.data[0]
             except Exception as e:
                 api_logger.exception(
                     "DB error fetching order for gateway_order_id %s: %s",
@@ -1755,25 +1748,63 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
             first_auth_id = related_auth_id
             last_capture_id = capture_id
 
+            # Build gateway_account_info reliably from PayPal order details
+            gateway_account_info = {}
+            try:
+                pp_order = await paypal_get_order(paypal_order_id)
+                if not isinstance(pp_order, dict):
+                    log_failure(api_logger, "Capture webhook: PayPal order response is not a JSON object")
+                else:
+                    payer = pp_order.get("payer")
+                    if isinstance(payer, dict):
+                        payer_info = payer.get("payer_info")
+                        email = payer.get("email_address")
+                        if not email and isinstance(payer_info, dict):
+                            email = payer_info.get("email")
+                        if email:
+                            gateway_account_info["email"] = email
+                    else:
+                        log_failure(api_logger, "Capture webhook: missing payer info in PayPal order")
+
+                    payment_source = pp_order.get("payment_source")
+                    card = payment_source.get("card") if isinstance(payment_source, dict) else None
+                    if isinstance(card, dict):
+                        cc = {}
+                        last4 = (
+                            card.get("last_digits")
+                            or card.get("last4")
+                            or card.get("number")
+                        )
+                        if last4:
+                            cc["number"] = last4
+                        ctype = card.get("brand") or card.get("type")
+                        if ctype:
+                            cc["type"] = ctype
+                        expiry = card.get("expiry") or None
+                        if not expiry:
+                            month = card.get("expiry_month")
+                            year = card.get("expiry_year")
+                            if month and year:
+                                expiry = f"{month}/{year}"
+                        if expiry:
+                            cc["expire"] = expiry
+                        if cc:
+                            gateway_account_info["credit_card"] = cc
+            except Exception:
+                api_logger.debug(
+                    "Could not fetch/parse PayPal order details for gateway_account_info on capture"
+                )
+
             # Step 1: idempotency check — skip only if an existing payment is already succeeded
             payments_row = None
             try:
-                payments_check = (
-                    supabase.table("payments")
-                    .select("id, status")
-                    .eq("order_id", order_id)
-                    .execute()
+                payments_list = supabase_get_payments(
+                    {"order_id": order_id}, columns="id,status"
                 )
-                api_logger.debug(
-                    "payments.check resp: %s", getattr(payments_check, "data", None)
-                )
-                if (
-                    getattr(payments_check, "data", None)
-                    and len(payments_check.data) > 0
-                ):
+                if payments_list:
                     # If any succeeded, short-circuit; otherwise keep a reference and continue to process
                     statuses = [
-                        (row.get("status") or "").lower() for row in payments_check.data
+                        (row.get("status") or "").lower() for row in payments_list
                     ]
                     if any(s == "succeeded" for s in statuses):
                         api_logger.info(
@@ -1781,7 +1812,7 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                             order_id,
                         )
                         return {"status": "ok"}
-                    payments_row = payments_check.data[0]
+                    payments_row = payments_list[0]
             except Exception as e:
                 api_logger.exception(
                     "Failed to check existing payments for order %s: %s", order_id, e
@@ -1793,7 +1824,8 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
             # Ensure a pending payment exists (webhook fallback for out-of-order events)
             try:
                 if payments_row is None:
-                    supabase.table("payments").insert(
+                    supabase_mutate_payment(
+                        "insert",
                         {
                             "order_id": order_id,
                             "user_id": order.get("buyer_id"),
@@ -1802,9 +1834,10 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                             "gateway_transaction_id": capture_id,
                             "amount": order.get("final_price"),
                             "currency": (order.get("currency") or "USD").upper(),
+                            "gateway_account_info": gateway_account_info or None,
                             "status": "pending",
-                        }
-                    ).execute()
+                        },
+                    )
                     api_logger.info(
                         "Inserted pending payment via capture webhook for order %s",
                         order_id,
@@ -1850,9 +1883,11 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
 
                     # Mark order as cancelled and record failure info
                     try:
-                        supabase.table("orders").update(
-                            {"status": "cancelled", "order_failed_info": error_msg}
-                        ).eq("id", order_id).execute()
+                        supabase_mutate_order(
+                            "update",
+                            {"status": "cancelled", "order_failed_info": error_msg},
+                            {"id": order_id},
+                        )
                         api_logger.info(
                             "Marked order %s as cancelled with failure info: %s",
                             order_id,
@@ -1864,11 +1899,14 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                             order_id,
                         )
 
-                    # Mark related payment(s) as failed
+                    # Mark related payment(s) as failed (include gateway_account_info when available)
                     try:
-                        supabase.table("payments").update({"status": "failed"}).eq(
-                            "order_id", order_id
-                        ).execute()
+                        fail_payload = {"status": "failed"}
+                        if gateway_account_info:
+                            fail_payload["gateway_account_info"] = gateway_account_info
+                        supabase_mutate_payment(
+                            "update", fail_payload, {"order_id": order_id}
+                        )
                         api_logger.info(
                             "Marked payments for order %s as failed after Shippo failure",
                             order_id,
@@ -1893,23 +1931,21 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                         )
                     try:
                         # If we already parsed authorization ids from resource above, void them explicitly
-                        pus_void = (
-                            (resource.get("purchase_units") or [])
-                            if isinstance(resource, dict)
-                            else []
-                        )
-                        if pus_void:
-                            payments_void = pus_void[0].get("payments") or {}
-                            auths_void = payments_void.get("authorizations") or []
-                            for a in auths_void:
-                                aid = a.get("id") if isinstance(a, dict) else None
-                                if aid:
-                                    try:
-                                        await paypal_void_authorization(aid)
-                                    except Exception:
-                                        api_logger.exception(
-                                            "Failed to void authorization %s", aid
-                                        )
+                        pus_void = resource.get("purchase_units") if isinstance(resource, dict) else []
+                        if pus_void and isinstance(pus_void, list) and pus_void:
+                            p0 = pus_void[0]
+                            payments_void = p0.get("payments") if isinstance(p0, dict) else None
+                            if isinstance(payments_void, dict):
+                                auths_void = payments_void.get("authorizations") or []
+                                for a in auths_void:
+                                    aid = a.get("id") if isinstance(a, dict) else None
+                                    if aid:
+                                        try:
+                                            await paypal_void_authorization(aid)
+                                        except Exception:
+                                            api_logger.exception(
+                                                "Failed to void authorization %s", aid
+                                            )
                     except Exception:
                         # ignore parsing issues
                         pass
@@ -1952,20 +1988,25 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
 
                 # Best-effort: mark order cancelled and record failure info
                 try:
-                    supabase.table("orders").update(
-                        {"status": "cancelled", "order_failed_info": error_msg}
-                    ).eq("id", order_id).execute()
+                    supabase_mutate_order(
+                        "update",
+                        {"status": "cancelled", "order_failed_info": error_msg},
+                        {"id": order_id},
+                    )
                 except Exception:
                     api_logger.exception(
                         "Failed to update order %s as cancelled after generic Shippo failure",
                         order_id,
                     )
 
-                # Mark payment(s) failed as well
+                # Mark payment(s) failed as well (include gateway_account_info when available)
                 try:
-                    supabase.table("payments").update({"status": "failed"}).eq(
-                        "order_id", order_id
-                    ).execute()
+                    fail_payload = {"status": "failed"}
+                    if gateway_account_info:
+                        fail_payload["gateway_account_info"] = gateway_account_info
+                    supabase_mutate_payment(
+                        "update", fail_payload, {"order_id": order_id}
+                    )
                 except Exception:
                     api_logger.exception(
                         "Failed to mark payments failed for order %s after generic Shippo failure",
@@ -2010,11 +2051,10 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                     "gateway_transaction_id": capture_id,
                     "gateway_capture_id": capture_id,
                 }
-                upd_resp = (
-                    supabase.table("payments")
-                    .update(update_payload)
-                    .eq("order_id", order_id)
-                    .execute()
+                if gateway_account_info:
+                    update_payload["gateway_account_info"] = gateway_account_info
+                upd_resp = supabase_mutate_payment(
+                    "update", update_payload, {"order_id": order_id}
                 )
                 updated_count = len(getattr(upd_resp, "data", []) or [])
                 api_logger.info(
@@ -2025,20 +2065,20 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                 if updated_count == 0:
                     # Fallback: update the most recent payment row by id
                     try:
-                        pr2 = (
-                            supabase.table("payments")
-                            .select("id")
-                            .eq("order_id", order_id)
-                            .order("created_at", desc=True)
-                            .limit(1)
-                            .execute()
+                        existing = supabase_get_payments(
+                            {"order_id": order_id}, columns="id,created_at"
                         )
-                        if getattr(pr2, "data", None):
-                            pid = pr2.data[0].get("id")
+                        if existing:
+                            # choose latest by created_at when available
+                            latest = max(
+                                existing,
+                                key=lambda r: (r.get("created_at") or ""),
+                            )
+                            pid = latest.get("id")
                             if pid:
-                                supabase.table("payments").update(update_payload).eq(
-                                    "id", pid
-                                ).execute()
+                                supabase_mutate_payment(
+                                    "update", update_payload, {"id": pid}
+                                )
                                 api_logger.info(
                                     "Fallback payment update by id %s for order %s applied",
                                     pid,
@@ -2066,9 +2106,7 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                 }
                 if first_auth_id:
                     update_data["gateway_authorization_id"] = first_auth_id
-                supabase.table("orders").update(update_data).eq(
-                    "id", order_id
-                ).execute()
+                supabase_mutate_order("update", update_data, {"id": order_id})
             except Exception as e:
                 api_logger.exception(
                     "Failed to update order %s status: %s", order_id, e
@@ -2082,23 +2120,21 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                 listing_id = order.get("listing_id")
                 if listing_id:
                     # Cancel other awaiting_payment orders for same listing
-                    other_orders = (
-                        supabase.table("orders")
-                        .select("id")
-                        .eq("listing_id", listing_id)
-                        .neq("id", order_id)
-                        .eq("status", "awaiting_payment")
-                        .execute()
+                    siblings = supabase_get_orders(
+                        {
+                            "listing_id": listing_id,
+                            "status": "awaiting_payment",
+                            "id": {"neq": order_id},
+                        },
+                        columns="id",
                     )
                     other_ids = [
-                        row.get("id")
-                        for row in (getattr(other_orders, "data", []) or [])
-                        if row.get("id")
+                        row.get("id") for row in (siblings or []) if row.get("id")
                     ]
                     if other_ids:
-                        supabase.table("orders").update({"status": "cancelled"}).in_(
-                            "id", other_ids
-                        ).execute()
+                        supabase_mutate_order(
+                            "update", {"status": "cancelled"}, {"id": {"in": other_ids}}
+                        )
                         api_logger.info(
                             "Cancelled %d sibling order(s) for listing %s",
                             len(other_ids),
@@ -2106,9 +2142,11 @@ async def paypal_webhook_order_handler(request: Request) -> dict:
                         )
                         # Cancel payments for those orders (if not already succeeded)
                         try:
-                            supabase.table("payments").update(
-                                {"status": "cancelled"}
-                            ).in_("order_id", other_ids).execute()
+                            supabase_mutate_payment(
+                                "update",
+                                {"status": "cancelled"},
+                                {"order_id": {"in": other_ids}},
+                            )
                             api_logger.info(
                                 "Marked payments as cancelled for sibling orders: %s",
                                 other_ids,
@@ -2154,9 +2192,9 @@ async def paypal_cancel_handler(
     try:
         if token:
             try:
-                supabase.table("orders").update({"status": "cancelled"}).eq(
-                    "gateway_order_id", token
-                ).execute()
+                supabase_mutate_order(
+                    "update", {"status": "cancelled"}, {"gateway_order_id": token}
+                )
                 api_logger.info(
                     "Marked order with gateway_order_id %s as cancelled", token
                 )
@@ -2166,7 +2204,6 @@ async def paypal_cancel_handler(
                 )
 
             try:
-                # Attempt to void any existing auth related to this order (safe if none)
                 await paypal_void_checkout(token)
             except Exception:
                 api_logger.exception(

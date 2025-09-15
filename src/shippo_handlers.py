@@ -61,7 +61,7 @@ async def shippo_rates_handler(
         )
         if not seller_addr_resp or not getattr(seller_addr_resp, "data", None):
             raise HTTPException(
-                status_code=404, detail=f"Seller address not found for user {seller_id}"
+                status_code=404, detail=f"Seller address not found, please ask seller to add it in their profile."
             )
         seller_addr = seller_addr_resp.data[0]
     except HTTPException:
@@ -99,7 +99,7 @@ async def shippo_rates_handler(
         )
         if not buyer_addr_resp or not getattr(buyer_addr_resp, "data", None):
             raise HTTPException(
-                status_code=404, detail=f"Buyer address not found for user {buyer_id}"
+                status_code=404, detail=f"Your address not found, please add it in your profile."
             )
         buyer_addr = buyer_addr_resp.data[0]
     except HTTPException:
