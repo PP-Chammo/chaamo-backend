@@ -19,8 +19,8 @@ class ScrapeRequest(BaseModel):
     query: Optional[str] = Field(
         None, description="Search keyword (e.g., '2023 Topps Merlin Lamine Yamal')"
     )
-    user_card_id: Optional[str] = Field(
-        None, description="Alternative to query: Use existing user card ID"
+    card_id: Optional[str] = Field(
+        None, description="Alternative to query: Use existing card ID"
     )
     max_pages: int = Field(
         50, description="Max pages to scrape (lower is faster)", ge=1, le=100
@@ -48,7 +48,7 @@ class WorkerTaskResponse(BaseModel):
     query: str = Field(..., description="Search query used")
     region: str = Field(..., description="Region scraped")
     category_id: int = Field(..., description="Category ID used")
-    user_card_id: Optional[str] = Field(None, description="User card ID if used")
+    card_id: Optional[str] = Field(None, description="Card ID if used")
     max_pages: int = Field(..., description="Maximum pages to scrape")
     created_at: datetime = Field(..., description="Task creation timestamp")
     started_at: Optional[datetime] = Field(None, description="Task start timestamp")

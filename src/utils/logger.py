@@ -8,6 +8,31 @@ from datetime import datetime
 from typing import Optional
 
 
+class HealthCheckFilter(logging.Filter):
+    """Filter to suppress health check access logs from Uvicorn."""
+
+    def filter(self, record):
+        # Filter out health check requests
+        if hasattr(record, "args") and record.args:
+            # Check if it's an access log record with the message format
+            if len(record.args) >= 3:
+                method_path = record.args[1] if len(record.args) > 1 else ""
+                if isinstance(method_path, str) and "GET /health" in method_path:
+                    return False
+
+        # Check the message itself
+        if hasattr(record, "message"):
+            if "GET /health" in record.message:
+                return False
+
+        # Check the raw message
+        if hasattr(record, "msg") and isinstance(record.msg, str):
+            if "GET /health" in record.msg:
+                return False
+
+        return True
+
+
 class ColorFormatter(logging.Formatter):
     """Custom formatter with colors and emojis for beautiful terminal output."""
 
@@ -162,13 +187,27 @@ def log_database_operation(
     logger.info(f"💾 {operation} {count} records to {table}")
 
 
-def log_error_with_context(logger: logging.Logger, error: Exception, context: str):
-    """Log error with context in a beautiful format."""
-    logger.error(f"❌ {context}: {str(error)}")
-
-
 # Create module-level loggers
 api_logger = setup_logger("chaamo.api")
 worker_logger = setup_logger("chaamo.worker")
 scraper_logger = setup_logger("chaamo.scraper")
 scheduler_logger = setup_logger("chaamo.scheduler")
+
+
+# Convenience helpers for explicit success/failure context
+def log_success(logger: logging.Logger, message: str):
+    """Log a successful outcome with an explicit tag.
+
+    Uses INFO level which already renders with a green check via ColorFormatter.
+    The explicit [OK] tag makes scanning easier even in plain text environments.
+    """
+    logger.info(f"[OK] {message}")
+
+
+def log_failure(logger: logging.Logger, message: str):
+    """Log a failed outcome with an explicit tag.
+
+    Uses ERROR level which already renders with a red cross via ColorFormatter.
+    The explicit [FAIL] tag makes scanning easier even in plain text environments.
+    """
+    logger.error(f"[FAIL] {message}")

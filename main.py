@@ -1,19 +1,30 @@
 from contextlib import asynccontextmanager
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 from src.api.v1 import router as v1_endpoint
 from src.scheduler import start_ebay_cronjob, stop_ebay_cronjob
-import atexit
+from src.utils.playwright import ensure_playwright_browsers
+from src.utils.logger import api_logger, scheduler_logger
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Load environment variables
+    load_dotenv()
+    env = (os.environ.get("ENV") or os.environ.get("APP_ENV") or "development").lower()
+
     # Startup
-    print("🕐 Starting eBay cronjob scheduler...")
+    if env != "production":
+        ensure_playwright_browsers()
+    else:
+        scheduler_logger.info("Skipping Playwright setup in production environment")
+    scheduler_logger.info("Starting eBay cronjob scheduler...")
     start_ebay_cronjob()
     yield
     # Shutdown
-    print("🛑 Stopping eBay cronjob scheduler...")
+    scheduler_logger.info("Stopping eBay cronjob scheduler...")
     stop_ebay_cronjob()
 
 
@@ -47,9 +58,9 @@ def health_check():
 # debug purpose, because in render.com swagger cant be load
 try:
     app.openapi()
-    print("✅ OpenAPI schema valid 🎉")
+    api_logger.info("OpenAPI schema generated successfully")
 except Exception as e:
-    print("❌ Failed to generate OpenAPI schema:", e)
+    api_logger.exception("Failed to generate OpenAPI schema: %s", e)
 
 # To run this application for development:
 # uvicorn main:app --reload
