@@ -197,6 +197,21 @@ def supabase_get_membership_plan(filters: dict, columns: str = "*") -> dict | No
         )
 
 
+def supabase_get_boost_plan(filters: dict, columns: str = "*") -> dict | None:
+    """Get a single boost plan matching filters."""
+    try:
+        q = supabase_apply_filter(supabase.table("boost_plans").select(columns), filters)
+        res = q.limit(1).execute()
+        if getattr(res, "data", None):
+            return res.data[0]
+        return None
+    except Exception as e:
+        sb_logger.exception("supabase_get_boost_plan failed: %s", e)
+        raise HTTPException(
+            status_code=500, detail="Database fetch error (boost_plans)"
+        )
+
+
 def supabase_get_profile(filters: dict, columns: str = "*") -> dict | None:
     """Get a single profile matching filters."""
     try:
@@ -255,6 +270,43 @@ def supabase_get_listing_card(filters: dict, columns: str = "*") -> dict | None:
         )
 
 
+def supabase_get_listing(filters: dict, columns: str = "*") -> dict | None:
+    """Get a single listing matching filters."""
+    try:
+        q = supabase_apply_filter(supabase.table("listings").select(columns), filters)
+        res = q.limit(1).execute()
+        if getattr(res, "data", None):
+            return res.data[0]
+        return None
+    except Exception as e:
+        sb_logger.exception("supabase_get_listing failed: %s", e)
+        raise HTTPException(status_code=500, detail="Database fetch error (listings)")
+
+
+def supabase_get_boost_listing(filters: dict, columns: str = "*") -> dict | None:
+    """Get a single boost listing matching filters."""
+    try:
+        q = supabase_apply_filter(supabase.table("boost_listings").select(columns), filters)
+        res = q.limit(1).execute()
+        if getattr(res, "data", None):
+            return res.data[0]
+        return None
+    except Exception as e:
+        sb_logger.exception("supabase_get_boost_listing failed: %s", e)
+        raise HTTPException(status_code=500, detail="Database fetch error (boost_listings)")
+
+
+def supabase_get_boost_listings(filters: dict, columns: str = "*") -> list[dict]:
+    """Get list of boost listings matching filters."""
+    try:
+        q = supabase_apply_filter(supabase.table("boost_listings").select(columns), filters)
+        res = q.execute()
+        return list(getattr(res, "data", []) or [])
+    except Exception as e:
+        sb_logger.exception("supabase_get_boost_listings failed: %s", e)
+        raise HTTPException(status_code=500, detail="Database fetch error (boost_listings)")
+
+
 # ===============================================================
 # insert / update mutate
 # ===============================================================
@@ -305,6 +357,25 @@ def supabase_mutate_payment(mutate_type: str, payload: dict, filters: dict | Non
     except Exception as e:
         sb_logger.exception("supabase_mutate_payment failed: %s", e)
         raise HTTPException(status_code=500, detail="Database mutate error (payments)")
+
+
+def supabase_mutate_boost_listing(
+    mutate_type: str, payload: dict, filters: dict | None = None
+):
+    """Insert or update boost_listings. Returns Supabase response."""
+    try:
+        table = supabase.table("boost_listings")
+        if mutate_type == "insert":
+            return table.insert(payload).execute()
+        if mutate_type == "update":
+            q = supabase_apply_filter(table.update(payload), filters)
+            return q.execute()
+        raise ValueError("mutate_type must be 'insert' or 'update'")
+    except Exception as e:
+        sb_logger.exception("supabase_mutate_boost_listing failed: %s", e)
+        raise HTTPException(
+            status_code=500, detail="Database mutate error (boost_listings)"
+        )
 
 
 # ===============================================================

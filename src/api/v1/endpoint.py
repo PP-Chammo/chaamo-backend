@@ -10,6 +10,9 @@ from src.paypal_handlers import (
     paypal_subscription_return_handler,
     paypal_subscription_cancel_handler,
     paypal_webhook_subscription_handler,
+    paypal_boost_handler,
+    paypal_boost_return_handler,
+    paypal_webhook_boost_handler,
     paypal_order_handler,
     paypal_order_return_handler,
     paypal_webhook_order_handler,
@@ -344,7 +347,7 @@ async def paypal_subscription_cancel(
     redirect: str = Query(..., description="Original app redirect deep link"),
     user_id: Optional[str] = Query(None, description="User ID"),
     plan_id: Optional[str] = Query(None, description="Plan ID"),
-    subscription_id: Optional[str] = Query(
+    paypal_subscription_id: Optional[str] = Query(
         None, description="PayPal subscription ID token"
     ),
 ):
@@ -352,7 +355,7 @@ async def paypal_subscription_cancel(
         redirect=redirect,
         user_id=user_id,
         plan_id=plan_id,
-        subscription_id=subscription_id,
+        paypal_subscription_id=paypal_subscription_id,
     )
 
 
@@ -379,6 +382,49 @@ async def paypal_subscription_return(
 @router.post("/paypal/webhook/subscription", summary="PayPal subscription plan webhook")
 async def paypal_webhooks(request: Request):
     return await paypal_webhook_subscription_handler(request=request)
+
+
+# Boost-post (mirrors subscription without cancel)
+@router.get("/paypal/boost-post", summary="PayPal boost-post API")
+async def paypal_boost_post(
+    request: Request,
+    user_id: str = Query(..., description="User ID (must be listing seller)"),
+    listing_id: str = Query(..., description="Listing ID to boost"),
+    plan_id: str = Query(..., description="Boost Plan ID"),
+    redirect: str = Query(..., description="App redirect deep link to return to after payment"),
+):
+    return await paypal_boost_handler(
+        request=request,
+        user_id=user_id,
+        listing_id=listing_id,
+        plan_id=plan_id,
+        redirect=redirect,
+    )
+
+
+@router.get(
+    "/paypal/boost-post/return",
+    summary="PayPal boost-post return redirect URL",
+)
+async def paypal_boost_return(
+    redirect: str = Query(..., description="Original app redirect deep link"),
+    user_id: str = Query(..., description="User ID"),
+    listing_id: str = Query(..., description="Listing ID"),
+    plan_id: str = Query(..., description="Boost Plan ID"),
+    subscription_id: Optional[str] = Query(None, description="PayPal subscription ID token"),
+):
+    return await paypal_boost_return_handler(
+        redirect=redirect,
+        user_id=user_id,
+        listing_id=listing_id,
+        plan_id=plan_id,
+        subscription_id=subscription_id,
+    )
+
+
+@router.post("/paypal/webhook/boost-post", summary="PayPal boost-post webhook")
+async def paypal_webhook_boost(request: Request):
+    return await paypal_webhook_boost_handler(request=request)
 
 
 @router.post("/paypal/order", summary="PayPal order API")

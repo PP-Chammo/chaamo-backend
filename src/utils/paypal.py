@@ -7,8 +7,7 @@ from typing import Optional, Tuple, Dict, Any
 from datetime import datetime
 from src.utils.logger import api_logger
 from src.utils.supabase import supabase
- 
- 
+
 
 PAYPAL_ENV = "sandbox"
 
@@ -110,6 +109,7 @@ async def paypal_get_order(order_id: str) -> dict:
     resp.raise_for_status()
     return resp.json()
 
+
 # ===============================================================
 # mutators — create/update/cancel actions
 # ===============================================================
@@ -120,6 +120,7 @@ async def paypal_create_subscription(
     return_url: str,
     cancel_url: str,
     user_details: Optional[Dict[str, str]] = None,
+    custom_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     try:
         token = await get_access_token()
@@ -134,6 +135,10 @@ async def paypal_create_subscription(
                 "cancel_url": cancel_url,
             },
         }
+
+        # Attach merchant metadata to help identify mapping in webhook (e.g., listing_id;plan_id)
+        if custom_id:
+            payload["custom_id"] = custom_id
 
         # optional subscriber info (helps PayPal prefill)
         if user_details:
@@ -294,9 +299,6 @@ async def paypal_create_order(
     }
 
 
- 
-
-
 # ===============================================================
 # Authorize Order
 # ===============================================================
@@ -320,7 +322,9 @@ async def paypal_authorize_order(order_id: str) -> Dict[str, Any]:
         resp.raise_for_status()
         return resp.json()
     except httpx.HTTPStatusError as he:
-        api_logger.error("PayPal authorize failed: %s", getattr(he.response, "text", he))
+        api_logger.error(
+            "PayPal authorize failed: %s", getattr(he.response, "text", he)
+        )
         # Re-raise so callers (e.g., paypal_void_checkout) can handle gracefully
         raise
     except Exception as e:
@@ -355,14 +359,18 @@ async def paypal_void_authorization(authorization_id: str) -> bool:
         resp.raise_for_status()
         return True
     except httpx.HTTPStatusError as he:
-        api_logger.error("PayPal void authorization failed: %s", getattr(he.response, "text", he))
+        api_logger.error(
+            "PayPal void authorization failed: %s", getattr(he.response, "text", he)
+        )
         raise HTTPException(status_code=502, detail="Payment provider void error")
     except Exception as e:
         api_logger.exception("PayPal void authorization unexpected error: %s", e)
         raise HTTPException(status_code=500, detail="Payment provider void error")
 
 
-async def paypal_capture_authorization(authorization_id: str, amount: str | None = None, currency: str | None = None) -> dict:
+async def paypal_capture_authorization(
+    authorization_id: str, amount: str | None = None, currency: str | None = None
+) -> dict:
     """
     Capture a previously authorized payment.
     POST /v2/payments/authorizations/{authorization_id}/capture
@@ -399,9 +407,6 @@ async def paypal_capture_authorization(authorization_id: str, amount: str | None
         api_logger.exception("PayPal capture unexpected error: %s", e)
         raise
 
-
-
- 
 
 # ===============================================================
 # Void Checkout
@@ -470,7 +475,9 @@ async def paypal_void_checkout(order_id: str) -> bool:
 # ===============================================================
 # Cancel Subscription
 # ===============================================================
-async def paypal_cancel_subscription(subscription_id: str, reason: str | None = None) -> bool:
+async def paypal_cancel_subscription(
+    subscription_id: str, reason: str | None = None
+) -> bool:
     """
     Cancel a PayPal billing subscription.
 
@@ -562,7 +569,9 @@ async def paypal_fetch_price_by_subscription_id(paypal_subscription_id: str) -> 
 # ===============================================================
 # utilities — compute/parse helpers (local DB related)
 # ===============================================================
-async def paypal_compute_adjusted_start(user_id: str, plan_id: str, exclude_sub_id: Optional[str]) -> datetime:
+async def paypal_compute_adjusted_start(
+    user_id: str, plan_id: str, exclude_sub_id: Optional[str]
+) -> datetime:
     """Return a start datetime that does not overlap any existing active periods for (user, plan)."""
     now = datetime.now()
     try:
@@ -588,4 +597,99 @@ async def paypal_compute_adjusted_start(user_id: str, plan_id: str, exclude_sub_
     return now
 
 
- 
+# ===============================================================
+# Build payments.gateway_account_info from webhook resource
+# ===============================================================
+async def paypal_build_gateway_account_info(
+    paypal_subscription_id: str,
+    type_value: str,
+    plan_id: Optional[str],
+    resource: dict,
+) -> dict:
+    """Construct a normalized gateway_account_info payload (schema-only tidy; no logic change).
+
+    Output keys (conditionally included):
+      - type: "subscription" | "boost"
+      - plan_id: membership_plans.id | boost_plans.id
+      - paypal_subscription_id: the billing agreement/subscription id
+      - paypal_email: when paid with a PayPal account
+      - credit_card_type: "visa" | "master_card" (from brand)
+      - credit_card_expiry: "MM/YY"
+      - credit_card_last4: last 4 digits
+    """
+    info: dict = {
+        "type": type_value,
+        "plan_id": plan_id,
+        "paypal_subscription_id": paypal_subscription_id,
+    }
+
+    # Try extracting PayPal email
+    email = None
+    try:
+        if isinstance(resource, dict):
+            payer = resource.get("payer")
+            if isinstance(payer, dict):
+                email = (
+                    payer.get("email")
+                    or payer.get("email_address")
+                    or (
+                        isinstance(payer.get("payer_info"), dict)
+                        and payer["payer_info"].get("email")
+                    )
+                    or (
+                        isinstance(payer.get("payer_info"), dict)
+                        and payer["payer_info"].get("email_address")
+                    )
+                )
+            if not email and isinstance(resource.get("payment_source"), dict):
+                pp = resource["payment_source"].get("paypal")
+                if isinstance(pp, dict):
+                    email = pp.get("email_address")
+        # Fallback: fetch subscription
+        if not email and paypal_subscription_id:
+            access_token = await get_access_token()
+            async with httpx.AsyncClient(timeout=20) as client:
+                sres = await client.get(
+                    f"{get_api_base().rstrip('/')}/v1/billing/subscriptions/{paypal_subscription_id}",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                if sres.status_code == 200:
+                    sjson = sres.json() or {}
+                    subscriber = sjson.get("subscriber") or {}
+                    email = subscriber.get("email_address")
+    except Exception:
+        api_logger.exception("Failed extracting paypal_email from webhook resource")
+    if email:
+        info["paypal_email"] = email
+
+    # Extract credit card details if present (v2 schema)
+    try:
+        ps = resource.get("payment_source") if isinstance(resource, dict) else None
+        card = ps.get("card") if isinstance(ps, dict) else None
+        if isinstance(card, dict):
+            brand = (card.get("brand") or "").lower()
+            last4 = card.get("last_digits") or card.get("last4") or card.get("last_digits_number")
+            expiry = card.get("expiry")
+            if brand:
+                if "visa" in brand:
+                    info["credit_card_type"] = "visa"
+                elif "master" in brand:
+                    info["credit_card_type"] = "master_card"
+                else:
+                    info["credit_card_type"] = brand
+            if not expiry and card.get("expiry_year") and card.get("expiry_month"):
+                expiry = f"{str(card['expiry_month']).zfill(2)}/{str(card['expiry_year'])[-2:]}"
+            if expiry:
+                if "-" in expiry and "/" not in expiry:
+                    try:
+                        y, m = expiry.split("-")[:2]
+                        expiry = f"{str(m).zfill(2)}/{str(y)[-2:]}"
+                    except Exception:
+                        pass
+                info["credit_card_expiry"] = expiry
+            if last4:
+                info["credit_card_last4"] = str(last4)[-4:]
+    except Exception:
+        api_logger.exception("Failed extracting card details from webhook resource")
+
+    return info

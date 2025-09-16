@@ -18,6 +18,10 @@ from src.utils.supabase import (
     supabase_get_payment,
     supabase_get_payments,
     supabase_get_membership_plan,
+    supabase_get_boost_plan,
+    supabase_get_boost_listing,
+    supabase_get_boost_listings,
+    supabase_get_listing,
     supabase_get_listing_card,
     supabase_get_profile,
     supabase_get_user_address,
@@ -25,6 +29,7 @@ from src.utils.supabase import (
     supabase_mutate_payment,
     supabase_mutate_subscription,
     supabase_mutate_order,
+    supabase_mutate_boost_listing,
     supabase_delete_order,
 )
 from src.utils.currency import format_price
@@ -49,6 +54,7 @@ from src.utils.paypal import (
     paypal_fetch_price_by_subscription_id,
     paypal_compute_adjusted_start,
     paypal_parse_iso_dt,
+    paypal_build_gateway_account_info,
 )
 from src.utils.logger import (
     api_logger,
@@ -134,6 +140,7 @@ async def paypal_subscription_handler(
             return_url=return_url,
             cancel_url=cancel_url,
             user_details=None,
+            custom_id=f"plan:{plan_id}",
         )
 
         approval_url = subscription_resp.get("approval_url")
@@ -219,7 +226,47 @@ async def paypal_subscription_handler(
                 f"Inserted pending subscription id={primary_id} for user_id={user_id} plan_id={plan_id}",
             )
 
-        # 4. redirect user to PayPal approval page
+        # 4. Ensure pending payment exists at submit time and link to subscription (idempotent)
+        try:
+            # Get plan amount from PayPal plan id (source of truth)
+            plan_amount, plan_currency = await paypal_fetch_plan_fixed_price(
+                paypal_plan_id
+            )
+            pid = None
+            existing_pay = supabase_get_payment(
+                {"gateway_order_id": subscription_id}
+            )
+            if existing_pay:
+                pid = existing_pay.get("id")
+            else:
+                inserted_payment = supabase_mutate_payment(
+                    "insert",
+                    {
+                        "user_id": user_id,
+                        "gateway": "paypal",
+                        "gateway_order_id": subscription_id,
+                        "amount": plan_amount,
+                        "currency": (plan_currency or "USD"),
+                        "status": "pending",
+                    },
+                )
+                if getattr(inserted_payment, "data", None):
+                    pid = inserted_payment.data[0].get("id")
+            if pid and primary_id:
+                supabase_mutate_subscription(
+                    "update", {"payment_id": pid}, {"id": primary_id}
+                )
+                log_success(
+                    api_logger,
+                    f"Linked pending payment {pid} to pending subscription {primary_id}",
+                )
+        except Exception as e:
+            api_logger.exception(
+                "Submit-time pending payment creation/link failed for subscription: %s",
+                e,
+            )
+
+        # 5. redirect user to PayPal approval page
         return RedirectResponse(url=approval_url, status_code=302)
 
     except HTTPException:
@@ -236,20 +283,20 @@ async def paypal_subscription_cancel_handler(
     redirect: str,
     user_id: Optional[str] = None,
     plan_id: Optional[str] = None,
-    subscription_id: Optional[str] = None,
+    paypal_subscription_id: Optional[str] = None,
 ) -> RedirectResponse:
     log_api_request(
         api_logger,
         "GET",
         "/paypal/subscription/cancel",
-        {"user_id": user_id, "plan_id": plan_id, "subscription_id": subscription_id},
+        {"user_id": user_id, "plan_id": plan_id, "paypal_subscription_id": paypal_subscription_id},
     )
     try:
         paypal_subscription = None
         # Resolve local subscription row
-        if subscription_id:
+        if paypal_subscription_id:
             paypal_subscription = supabase_get_subscription(
-                {"paypal_subscription_id": subscription_id}
+                {"paypal_subscription_id": paypal_subscription_id}
             )
         elif user_id and plan_id:
             # Prefer pending, else active for this user+plan
@@ -262,7 +309,7 @@ async def paypal_subscription_cancel_handler(
                 )
 
         # Attempt remote cancellation if we have a PayPal id
-        paypal_id = subscription_id or (
+        paypal_id = paypal_subscription_id or (
             paypal_subscription.get("paypal_subscription_id")
             if paypal_subscription
             else None
@@ -311,7 +358,7 @@ async def paypal_subscription_cancel_handler(
         api_logger.exception("Error handling PayPal subscription cancel: %s", e)
         # Fall back to a safe redirect
         redirect_params = urlencode(
-            {"status": "cancel", "subscriptionId": subscription_id or ""}
+            {"status": "cancel", "subscriptionId": paypal_subscription_id or ""}
         )
         return RedirectResponse(
             url=f"{redirect}{'&' if '?' in redirect else '?'}{redirect_params}",
@@ -418,18 +465,6 @@ async def paypal_subscription_return_handler(
             subscription = supabase_get_subscription({"id": local_subscription_id})
             # Step 2: if no linked payment, insert one
             if not subscription or not subscription.get("payment_id"):
-                gateway_account_info = {}
-                subscriber = data.get("subscriber")
-                if not subscriber:
-                    log_failure(
-                        api_logger,
-                        "PayPal return: missing subscriber in subscription details",
-                    )
-                else:
-                    email = subscriber.get("email_address")
-                    if email:
-                        gateway_account_info["email"] = email
-
                 plan_id_val = data.get("plan_id")
                 if not plan_id_val:
                     log_failure(
@@ -439,6 +474,12 @@ async def paypal_subscription_return_handler(
                 else:
                     plan_amount, plan_currency = await paypal_fetch_plan_fixed_price(
                         plan_id_val
+                    )
+                    gateway_account_info = await paypal_build_gateway_account_info(
+                        paypal_sub_id,
+                        "subscription",
+                        plan_id,
+                        data,
                     )
                     inserted_payment = supabase_mutate_payment(
                         "insert",
@@ -636,9 +677,40 @@ async def paypal_webhook_subscription_handler(request: Request) -> dict:
                     {"paypal_subscription_id": paypal_sub_id}
                 )
                 if subscription:
+                    # Resolve internal plan_id (fallback: map PayPal subscription.plan_id → membership_plans.id)
+                    internal_plan_id = subscription.get("plan_id")
+                    if not internal_plan_id:
+                        try:
+                            access_token = await get_access_token()
+                            async with httpx.AsyncClient(timeout=20) as client:
+                                sres = await client.get(
+                                    f"{get_api_base().rstrip('/')}/v1/billing/subscriptions/{paypal_sub_id}",
+                                    headers={"Authorization": f"Bearer {access_token}"},
+                                )
+                                if sres.status_code == 200:
+                                    sjson = sres.json() or {}
+                                    pp_plan_id = sjson.get("plan_id")
+                                    if pp_plan_id:
+                                        plan_row = supabase_get_membership_plan(
+                                            {"paypal_plan_id": pp_plan_id}, columns="id"
+                                        )
+                                        if plan_row:
+                                            internal_plan_id = plan_row.get("id")
+                        except Exception:
+                            api_logger.exception(
+                                "Failed to map PayPal plan id to internal plan id for subscription %s",
+                                subscription.get("id"),
+                            )
                     # One payment per subscription cycle:
                     # 1) Prefer updating the linked pending payment via subscriptions.payment_id
                     # 2) Else, idempotent upsert by gateway_transaction_id and link it
+                    # Build gateway account info once for reuse
+                    gateway_info = await paypal_build_gateway_account_info(
+                        paypal_sub_id,
+                        "subscription",
+                        internal_plan_id,
+                        resource,
+                    )
                     updated = False
                     pid = subscription.get("payment_id")
                     if pid:
@@ -651,6 +723,7 @@ async def paypal_webhook_subscription_handler(request: Request) -> dict:
                                 "gateway_order_id": paypal_sub_id,
                                 "amount": amount_val,
                                 "currency": currency_val,
+                                "gateway_account_info": gateway_info,
                             },
                             {"id": pid},
                         )
@@ -676,6 +749,7 @@ async def paypal_webhook_subscription_handler(request: Request) -> dict:
                                     "gateway_order_id": paypal_sub_id,
                                     "amount": amount_val,
                                     "currency": currency_val,
+                                    "gateway_account_info": gateway_info,
                                 },
                                 {"id": pid},
                             )
@@ -708,6 +782,12 @@ async def paypal_webhook_subscription_handler(request: Request) -> dict:
                                     "amount": amount_val,
                                     "currency": currency_val,
                                     "status": "succeeded",
+                                    "gateway_account_info": await paypal_build_gateway_account_info(
+                                        paypal_sub_id,
+                                        "subscription",
+                                        internal_plan_id,
+                                        resource,
+                                    ),
                                 },
                             )
                             if getattr(inserted_payment, "data", None):
@@ -783,6 +863,407 @@ async def paypal_webhook_subscription_handler(request: Request) -> dict:
 
     except Exception as e:
         api_logger.exception("PayPal webhook error: %s", e)
+        raise HTTPException(status_code=400, detail="Invalid webhook payload")
+
+
+# ===============================================================
+# /paypal/boost-post
+# ===============================================================
+
+
+async def paypal_boost_handler(
+    request: Request,
+    user_id: str,
+    listing_id: str,
+    plan_id: str,
+    redirect: str,
+):
+    """Start PayPal checkout using Subscriptions API for boost-post.
+    Differences from membership: uses `boost_plans` and later creates a row in `boost_listings`.
+    """
+    log_api_request(
+        api_logger,
+        "GET",
+        "/paypal/boost-post",
+        {"user_id": user_id, "listing_id": listing_id, "plan_id": plan_id, "redirect": redirect},
+    )
+    try:
+        # Validate listing belongs to the user initiating the boost
+        listing = supabase_get_listing(
+            {"id": listing_id}, columns="id, seller_id"
+        )
+        if not listing:
+            api_logger.error("Listing not found for boost: %s", listing_id)
+            raise HTTPException(status_code=404, detail="Listing not found")
+        if (listing.get("seller_id") or "") != user_id:
+            api_logger.error(
+                "Boost listing seller mismatch: user=%s listing.seller=%s",
+                user_id,
+                listing.get("seller_id"),
+            )
+            raise HTTPException(status_code=403, detail="Cannot boost other user's listing")
+
+        # 1) fetch PayPal plan id from boost_plans
+        boost_plan = supabase_get_boost_plan(
+            {"id": plan_id}, columns="id,paypal_plan_id,boost_days,currency,price"
+        )
+        if not boost_plan:
+            api_logger.error("Boost plan not found: %s", plan_id)
+            raise HTTPException(status_code=404, detail="Boost plan not found")
+        paypal_plan_id = boost_plan.get("paypal_plan_id")
+        if not paypal_plan_id:
+            raise HTTPException(status_code=400, detail="Boost plan missing PayPal plan id")
+
+        # 2) build return/cancel urls embedding identifiers
+        base = paypal_get_base_url(request)
+        return_url = f"{base}/api/v1/paypal/boost-post/return?{urlencode({'redirect': redirect, 'user_id': user_id, 'listing_id': listing_id, 'plan_id': plan_id})}"
+        cancel_url = f"{base}/api/v1/paypal/cancel?{urlencode({'redirect': redirect})}"
+
+        subscription_resp = await paypal_create_subscription(
+            plan_id=paypal_plan_id,
+            return_url=return_url,
+            cancel_url=cancel_url,
+            user_details=None,
+            custom_id=f"listing:{listing_id}|plan:{plan_id}",
+        )
+
+        approval_url = subscription_resp.get("approval_url")
+        paypal_subscription_id = subscription_resp.get("subscription_id")
+        if not approval_url or not paypal_subscription_id:
+            api_logger.error("PayPal create-subscription (boost) missing approval_url or subscription_id")
+            raise HTTPException(status_code=500, detail="Payment provider error")
+
+        # 3) Create pending payment and pending boost_listings (no gateway_account_info)
+        try:
+            # Fetch price from PayPal plan (source of truth)
+            amount_val, currency_val = await paypal_fetch_plan_fixed_price(paypal_plan_id)
+
+            # Insert payment pending (maps to PayPal subscription via gateway_order_id)
+            existing_payment = supabase_get_payment({"gateway_order_id": paypal_subscription_id})
+            payment_id = None
+            if existing_payment:
+                payment_id = existing_payment.get("id")
+            else:
+                insert_pay = supabase_mutate_payment(
+                    "insert",
+                    {
+                        "user_id": user_id,
+                        "gateway": "paypal",
+                        "gateway_order_id": paypal_subscription_id,
+                        "amount": amount_val,
+                        "currency": (currency_val or "USD"),
+                        "status": "pending",
+                    },
+                )
+                if not getattr(insert_pay, "data", None):
+                    api_logger.error("Failed to insert pending payment for boost")
+                else:
+                    payment_id = insert_pay.data[0].get("id")
+
+            # Insert boost_listings pending linked to payment
+            if payment_id:
+                # Avoid duplicate pending boost rows for the same payment
+                existing_boost = supabase_get_boost_listing({"payment_id": payment_id})
+                if not existing_boost:
+                    # Insert pending boost without schedule; schedule will be set on ACTIVATED webhook
+                    ins_boost = supabase_mutate_boost_listing(
+                        "insert",
+                        {
+                            "listing_id": listing_id,
+                            "plan_id": plan_id,
+                            "payment_id": payment_id,
+                            "status": "pending",
+                        },
+                    )
+                    if not getattr(ins_boost, "data", None):
+                        api_logger.error(
+                            "Failed to insert pending boost_listings for listing %s (payment %s)",
+                            listing_id,
+                            payment_id,
+                        )
+                    else:
+                        log_success(
+                            api_logger,
+                            f"Inserted pending boost_listings {ins_boost.data[0].get('id')} for listing={listing_id} plan={plan_id}",
+                        )
+        except Exception as e:
+            api_logger.exception("Failed to create pending payment/boost row for boost flow: %s", e)
+
+        # 4) redirect to approval
+        return RedirectResponse(url=approval_url, status_code=302)
+    except HTTPException:
+        raise
+    except Exception as e:
+        api_logger.exception("PayPal boost checkout failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Boost checkout error: {e}")
+
+
+# ===============================================================
+# /paypal/boost-post/return
+# ===============================================================
+async def paypal_boost_return_handler(
+    redirect: str,
+    user_id: str,
+    listing_id: str,
+    plan_id: str,
+    subscription_id: Optional[str],
+) -> RedirectResponse:
+    try:
+        log_api_request(
+            api_logger,
+            "GET",
+            "/paypal/boost-post/return",
+            {
+                "subscription_id": subscription_id,
+                "user_id": user_id,
+                "listing_id": listing_id,
+                "plan_id": plan_id,
+            },
+        )
+
+        if not all([subscription_id, user_id, listing_id, plan_id, redirect]):
+            api_logger.error("Boost return: missing params")
+            params = urlencode({"status": "error", "reason": "missing_params"})
+            return RedirectResponse(f"{redirect}?{params}", status_code=302)
+
+        paypal_sub_id = subscription_id
+        token = await get_access_token()
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{get_api_base().rstrip('/')}/v1/billing/subscriptions/{paypal_sub_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        # Nothing else to persist here; pending payment and boost_listings are created on submit.
+
+        # Redirect back to client
+        redirect_params = urlencode({"status": "success", "subscriptionId": paypal_sub_id})
+        return RedirectResponse(
+            f"{redirect}{'&' if '?' in redirect else '?'}{redirect_params}",
+            status_code=302,
+        )
+    except Exception as e:
+        api_logger.exception("Error handling PayPal boost return: %s", e)
+        redirect_out = redirect or "/"
+        redirect_params = urlencode(
+            {"status": "error", "subscriptionId": subscription_id or "", "reason": "internal_error"}
+        )
+        return RedirectResponse(
+            f"{redirect_out}{'&' if '?' in redirect_out else '?'}{redirect_params}",
+            status_code=302,
+        )
+
+
+# ===============================================================
+# /paypal/webhook/boost-post
+# ===============================================================
+async def paypal_webhook_boost_handler(request: Request) -> dict:
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            log_failure(api_logger, "Boost webhook: body is not a JSON object")
+            body = {}
+        event_type = body.get("event_type")
+        resource = body.get("resource")
+        log_api_request(
+            api_logger,
+            "POST",
+            "/paypal/webhook/boost-post triggered",
+            {"event_type": event_type},
+        )
+
+        if not event_type or not isinstance(resource, dict):
+            return {"status": "ignored"}
+
+        subscription_id = resource.get("id")
+        # -------------- ACTIVATED --------------
+        if event_type == "BILLING.SUBSCRIPTION.ACTIVATED":
+            # Find pending payment by gateway_order_id
+            payment_row = supabase_get_payment({"gateway_order_id": subscription_id})
+            if not payment_row:
+                # If missing unexpectedly, create a minimal pending payment to allow linking
+                try:
+                    amount_val, currency_val = await paypal_fetch_price_by_subscription_id(subscription_id)
+                except Exception:
+                    amount_val, currency_val = None, None
+                inserted = supabase_mutate_payment(
+                    "insert",
+                    {
+                        "gateway": "paypal",
+                        "gateway_order_id": subscription_id,
+                        "amount": amount_val,
+                        "currency": (currency_val or "USD"),
+                        "status": "pending",
+                    },
+                )
+                payment_row = inserted.data[0] if getattr(inserted, "data", None) else None
+            if not payment_row:
+                api_logger.error("Boost ACTIVATED but no payment mapping for subscription %s", subscription_id)
+                return {"status": "ok"}
+
+            # Find associated boost_listings via payment_id; if missing, parse from PayPal custom_id
+            boost_row = supabase_get_boost_listing({"payment_id": payment_row.get("id")})
+            listing_id = None
+            plan_id = None
+            if boost_row:
+                listing_id = boost_row.get("listing_id")
+                plan_id = boost_row.get("plan_id")
+            else:
+                # Try to recover mapping from PayPal resource.custom_id
+                custom_id = resource.get("custom_id") if isinstance(resource, dict) else None
+                if isinstance(custom_id, str) and "listing:" in custom_id and "|" in custom_id:
+                    try:
+                        parts = dict(
+                            p.split(":", 1) for p in custom_id.split("|") if ":" in p
+                        )
+                        listing_id = parts.get("listing")
+                        plan_id = parts.get("plan")
+                    except Exception:
+                        listing_id, plan_id = None, None
+                if not listing_id or not plan_id:
+                    api_logger.error(
+                        "Boost ACTIVATED but boost_listings not found and custom_id missing/invalid for payment %s",
+                        payment_row.get("id"),
+                    )
+                    return {"status": "ok"}
+
+            # Compute adjusted start to avoid overlapping boosts
+            now_dt = datetime.now()
+            latest_end = None
+            try:
+                existing = supabase_get_boost_listings(
+                    {"listing_id": listing_id, "status": "active"},
+                    columns="id,start_time,end_time,status",
+                )
+                for b in existing:
+                    st = paypal_parse_iso_dt(b.get("start_time"))
+                    et = paypal_parse_iso_dt(b.get("end_time"))
+                    if et and et > now_dt and (latest_end is None or et > latest_end):
+                        latest_end = et
+            except Exception:
+                api_logger.exception("Failed to compute adjusted boost start; using now")
+            start_dt = latest_end if latest_end and latest_end > now_dt else now_dt
+
+            # Determine boost duration from boost_plans
+            boost_plan = supabase_get_boost_plan({"id": plan_id}, columns="boost_days")
+            boost_days = int((boost_plan or {}).get("boost_days") or 1)
+            end_dt = start_dt + timedelta(days=boost_days)
+
+            # Update existing boost_listings to active, or create if missing
+            if boost_row:
+                upd = supabase_mutate_boost_listing(
+                    "update",
+                    {
+                        "start_time": start_dt.isoformat(),
+                        "end_time": end_dt.isoformat(),
+                        "status": "active",
+                    },
+                    {"id": boost_row.get("id")},
+                )
+                if not getattr(upd, "data", None):
+                    api_logger.error("Failed to activate boost_listings %s", boost_row.get("id"))
+                else:
+                    api_logger.info(
+                        "Activated boost %s for listing %s from %s to %s",
+                        boost_row.get("id"),
+                        listing_id,
+                        start_dt.isoformat(),
+                        end_dt.isoformat(),
+                    )
+            else:
+                # Insert active row as fallback if none existed
+                ins = supabase_mutate_boost_listing(
+                    "insert",
+                    {
+                        "listing_id": listing_id,
+                        "plan_id": plan_id,
+                        "payment_id": payment_row.get("id"),
+                        "start_time": start_dt.isoformat(),
+                        "end_time": end_dt.isoformat(),
+                        "status": "active",
+                    },
+                )
+                if not getattr(ins, "data", None):
+                    api_logger.error(
+                        "Failed to insert active boost_listings for listing %s (payment %s)",
+                        listing_id,
+                        payment_row.get("id"),
+                    )
+                else:
+                    api_logger.info(
+                        "Inserted active boost %s for listing %s from %s to %s",
+                        ins.data[0].get("id"),
+                        listing_id,
+                        start_dt.isoformat(),
+                        end_dt.isoformat(),
+                    )
+            return {"status": "ok"}
+
+        # -------------- CANCELLED --------------
+        if event_type == "BILLING.SUBSCRIPTION.CANCELLED":
+            # mark payment cancelled if exists
+            pay = supabase_get_payment({"gateway_order_id": subscription_id})
+            if pay:
+                supabase_mutate_payment("update", {"status": "cancelled"}, {"id": pay.get("id")})
+                boost_row = supabase_get_boost_listing({"payment_id": pay.get("id")})
+                if boost_row:
+                    supabase_mutate_boost_listing("update", {"status": "cancelled"}, {"id": boost_row.get("id")})
+            return {"status": "ok"}
+
+        # -------------- PAYMENT.SALE.COMPLETED --------------
+        if event_type == "PAYMENT.SALE.COMPLETED":
+            paypal_sub_id = resource.get("billing_agreement_id")
+            txn_id = resource.get("id")
+            amt_obj = resource.get("amount") or {}
+            amount_val = amt_obj.get("total")
+            currency_val = amt_obj.get("currency")
+            if not paypal_sub_id:
+                return {"status": "ignored"}
+            # Update pending payment to succeeded and populate gateway_account_info
+            existing_txn_row = supabase_get_payment({"gateway_order_id": paypal_sub_id})
+            if existing_txn_row:
+                # Try to enrich mapping from boost_listings via payment_id
+                listing_id = None
+                plan_id = None
+                boost_row = supabase_get_boost_listing({"payment_id": existing_txn_row.get("id")})
+                if boost_row:
+                    listing_id = boost_row.get("listing_id")
+                    plan_id = boost_row.get("plan_id")
+                else:
+                    # Fallback: parse custom_id from webhook resource
+                    custom_id = resource.get("custom_id") if isinstance(resource, dict) else None
+                    if isinstance(custom_id, str) and "listing:" in custom_id and "|" in custom_id:
+                        try:
+                            parts = dict(p.split(":", 1) for p in custom_id.split("|") if ":" in p)
+                            listing_id = listing_id or parts.get("listing")
+                            plan_id = plan_id or parts.get("plan")
+                        except Exception:
+                            listing_id, plan_id = listing_id, plan_id
+
+                supabase_mutate_payment(
+                    "update",
+                    {
+                        "status": "succeeded",
+                        "gateway_transaction_id": txn_id,
+                        "gateway_capture_id": txn_id,
+                        "amount": amount_val,
+                        "currency": currency_val,
+                        "gateway_account_info": await paypal_build_gateway_account_info(
+                            paypal_sub_id,
+                            "boost",
+                            plan_id,
+                            resource,
+                        ),
+                    },
+                    {"id": existing_txn_row.get("id")},
+                )
+            return {"status": "ok"}
+
+        return {"status": "ignored"}
+    except Exception as e:
+        api_logger.exception("PayPal boost webhook error: %s", e)
         raise HTTPException(status_code=400, detail="Invalid webhook payload")
 
 
