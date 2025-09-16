@@ -346,7 +346,7 @@ async def paypal_subscription_cancel_handler(
             )
 
         redirect_params = urlencode(
-            {"status": "cancel", "subscriptionId": paypal_id or ""}
+            {"status": "success", "message": "Your subscription was cancelled successfully", "subscriptionId": paypal_id or ""}
         )
         return RedirectResponse(
             url=f"{redirect}{'&' if '?' in redirect else '?'}{redirect_params}",
