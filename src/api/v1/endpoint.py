@@ -257,7 +257,7 @@ async def start_tcdb_scrape(
             "browse": [b.value for b in browse] if browse else None,
         }
     except Exception as e:
-        log_error_with_context(api_logger, e, "starting TCDB scrape")
+        api_logger.error(e, "starting TCDB scrape")
         raise HTTPException(
             status_code=500, detail=f"Failed to start TCDB scrape: {str(e)}"
         )
