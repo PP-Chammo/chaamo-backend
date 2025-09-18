@@ -328,15 +328,13 @@ async def shippo_rates_handler(
                 raw_amount_val = raw_amount.get("amount") or raw_amount.get("value")
             else:
                 raw_amount_val = raw_amount
-
+            label = f"{get_attr(r, 'provider') or ''} - {get_attr(get_attr(r, 'servicelevel', None), 'name', '')}" or ""
             amount_float = float(raw_amount_val)
             currency = get_attr(r, "currency_local") or get_attr(r, "currency") or ""
             parsed.append(
                 RateOption(
                     id=get_attr(r, "object_id"),
-                    service=(
-                        get_attr(get_attr(r, "servicelevel", None), "name", "") or ""
-                    ),
+                    service=label,
                     courier=get_attr(r, "provider") or "",
                     amount=amount_float,
                     currency=currency,
