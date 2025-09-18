@@ -45,9 +45,9 @@ class WorkerTaskResponse(BaseModel):
     status: str = Field(
         ..., description="Task status (pending/running/completed/failed)"
     )
-    query: str = Field(..., description="Search query used")
+    query: Optional[str] = Field(None, description="Search query used (if any)")
     region: str = Field(..., description="Region scraped")
-    category_id: int = Field(..., description="Category ID used")
+    category_id: Optional[int] = Field(None, description="Category ID used (if any)")
     card_id: Optional[str] = Field(None, description="Card ID if used")
     max_pages: int = Field(..., description="Maximum pages to scrape")
     created_at: datetime = Field(..., description="Task creation timestamp")
@@ -104,9 +104,9 @@ class ScrapeStartResponse(BaseModel):
     task_id: str = Field(..., description="Unique task identifier")
     status: str = Field(..., description="Initial task status")
     message: str = Field(..., description="Success message")
-    query: str = Field(..., description="Search query being used")
+    query: Optional[str] = Field(None, description="Search query being used (if any)")
     region: str = Field(..., description="Region being scraped")
-    category_id: int = Field(..., description="Category ID being used")
+    category_id: Optional[int] = Field(None, description="Category ID being used (if any)")
     estimated_duration: str = Field(
         "2-5 minutes", description="Estimated completion time"
     )

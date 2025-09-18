@@ -89,7 +89,7 @@ def ensure_playwright_browsers():
         logger.info("Playwright disabled in production; skipping browser install")
         return
     if not is_playwright_installed():
-        logger.info("Installing Playwright browsers (first run)...")
+        logger.info("🔧 Installing Playwright browsers (first run)...")
         subprocess.run(["playwright", "install", "chromium"], check=True)
     else:
         logger.info("Playwright browsers already installed.")

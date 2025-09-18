@@ -1,447 +1,160 @@
 import os
-import asyncio
-import math
-import random
 import re
-import unicodedata
-import difflib
-
-import dateutil.parser as date_parser
+import math
+import json
 import pytz
-from bs4 import BeautifulSoup
 import httpx
+import random
+import asyncio
+import difflib
+import unicodedata
+import dateutil.parser as date_parser
+from typing import Optional, Any, Dict, List
+from rapidfuzz import fuzz
+from typing import Optional, Any, Dict, List
+from bs4 import BeautifulSoup
 
-from src.utils.logger import scraper_logger
+from urllib.parse import urlencode
 from src.models.category import CategoryId
 from src.models.ebay import Region, base_target_url
 from src.utils.httpx import httpx_get_content
 from src.utils.supabase import supabase
-
-# use global scraper_logger
-
-try:
-    from rapidfuzz import process, fuzz  # type: ignore
-
-    _HAS_RAPIDFUZZ = True
-except Exception:
-    _HAS_RAPIDFUZZ = False
-
-DEFAULT_SET_NAMES = [
-    "Panini Prizm",
-    "Topps Chrome",
-    "Evolving Skies",
-    "Fusion Strike",
-    "Base Set",
-    "Jungle",
-    "Fossil",
-    "Modern Horizons",
-    "Shadowmoor",
-    "Topps Deco",
-    "Topps Finest",
-    "Topps Museum",
-    "Topps Merlin",
-    "Topps Stadium Club",
-    "Topps Superstars",
-    "Topps MLS",
-    "Topps Now",
-    "Topps Bundesliga",
-    "Topps Living Set",
-    "Topps UEFA",
-    "Topps FC Barcelona",
-    "Topps Liverpool",
-    "Topps Arsenal",
-    "Topps Manchester City",
-    "Topps PSG",
-    "Topps Bayern Munich",
-    "Topps Real Madrid",
-    "Topps Argentina",
-]
-
-RARITY_KEYWORDS = [
-    "common",
-    "uncommon",
-    "rare",
-    "ultra rare",
-    "super rare",
-    "secret rare",
-    "holo",
-    "holographic",
-    "holofoil",
-    "foil",
-    "parallel",
-    "first edition",
-    "1st edition",
-    "promo",
-    "limited",
-    "shiny",
-    "vmax",
-    "vstar",
-    "ex",
-    "gx",
-    "ultra",
-    "reverse holo",
-    "reverse-holo",
-]
-
-PARALLEL_KEYWORDS = [
-    "silver",
-    "gold",
-    "prizm",
-    "optic",
-    "rainbow",
-    "chromium",
-    "chrome",
-    "green parallel",
-    "blue parallel",
-]
-
-AUTOGRAPH_KEYWORDS = ["auto", "autograph", "signed", "signature", "certified autograph"]
-RELIC_KEYWORDS = ["relic", "patch", "jersey", "memorabilia", "game used"]
-LANGUAGE_MAP = {
-    "jpn": "Japanese",
-    "japanese": "Japanese",
-    "eng": "English",
-    "english": "English",
-    "kor": "Korean",
-    "korean": "Korean",
-    "ger": "German",
-    "german": "German",
-    "spa": "Spanish",
-    "spanish": "Spanish",
-}
-
-# Regex patterns
-_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
-_CARD_NUM_RE = re.compile(r"#\s*([0-9]{1,4}[A-Za-z]?)", re.IGNORECASE)
-_SERIAL_RE = re.compile(r"\b([0-9]{1,4}\s*/\s*[0-9]{1,4})\b")
-_GRADING_RE = re.compile(
-    r"\b(psa|bgs|cgc|sgc|csg|hga|gma)\s*\.?\s*#?\s*([0-9]{1,2}(?:\.\d)?)\b",
-    re.IGNORECASE,
-)
-_GRADING_ONLY_RE = re.compile(r"\b(psa|bgs|cgc|sgc|csg|hga|gma)\b", re.IGNORECASE)
+from src.utils.logger import scraper_logger
 
 
 # ===============================================================
-# Normalizer functions (moved from normalizer.py)
+# Extract year range
 # ===============================================================
-
-
-def _normalize_text(s: str) -> str:
-    if not s:
-        return ""
-    # remove accents, lower, keep slash for serials
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.lower()
-    # replace weird punctuation with spaces except slash and numbers
-    s = re.sub(r"[^a-z0-9/ ]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-# ===============================================================
-# Fuzzy matching helper
-# ===============================================================
-
-
-def _fuzzy_best_match(candidate: str, choices: list[str]) -> tuple[str | None, float]:
-    if not candidate or not choices:
-        return None, 0.0
-    if _HAS_RAPIDFUZZ:
-        # Use token_set_ratio for better handling of word order variations
-        best = process.extractOne(candidate, choices, scorer=fuzz.token_set_ratio)
-        if best:
-            name, score, _ = best
-            return name, float(score)
-        return None, 0.0
-    else:
-        # difflib fallback (ratio 0..1), convert to 0..100
-        match = difflib.get_close_matches(candidate, choices, n=1, cutoff=0.0)
-        if not match:
-            return None, 0.0
-        best = match[0]
-        score = difflib.SequenceMatcher(a=candidate, b=best).ratio() * 100.0
-        return best, float(score)
-
-
-# ===============================================================
-# Main normalize function
-# ===============================================================
-
-
-def normalize_card_title(
-    title: str, set_names: list[str] | None = None, fuzzy_threshold: float = 80.0
-) -> dict[str, any]:
-    """
-    Parse a raw title and return a dict with fixed keys:
-    {
-      year, set, set_score, rarity, parallel, card_number, serial_number,
-      player_or_character, grading, grade, autograph, relic_patch, language,
-      confidence: {field: score 0..1}, raw_title, normalized_title
-    }
-    """
-    if set_names is None:
-        set_names = DEFAULT_SET_NAMES
-
-    raw = title or ""
-    norm = _normalize_text(raw)
-
-    # initialize result with defaults
-    result = {
-        "year": None,
-        "set": None,
-        "set_score": 0.0,
-        "rarity": None,
-        "parallel": None,
-        "card_number": None,
-        "serial_number": None,
-        "player_or_character": None,
-        "grading": None,
-        "grade": None,
-        "autograph": False,
-        "relic_patch": False,
-        "language": None,
-        "confidence": {},
-        "raw_title": raw,
-        "normalized_title": norm,
-    }
-
-    # Year
-    y = _YEAR_RE.search(norm)
-    if y:
-        try:
-            result["year"] = int(y.group())
-            result["confidence"]["year"] = 1.0
-        except Exception:
-            result["confidence"]["year"] = 0.0
-    else:
-        result["confidence"]["year"] = 0.0
-
-    # Serial number (xx/yyy, /25, #123, etc.)
-    serial = _extract_serial_number(raw)
-    if serial:
-        result["serial_number"] = serial
-        result["confidence"]["serial_number"] = 1.0
-        # Remove serial pattern from normalized text for cleaner matching
-        serial_patterns_to_remove = [
-            f"/{serial}",
-            f"#{serial}",
-            f"{serial}/",
-            f" {serial}/",
-        ]
-        for pattern in serial_patterns_to_remove:
-            norm = norm.replace(pattern.lower(), "")
-    else:
-        result["confidence"]["serial_number"] = 0.0
-
-    # Card number (#123)
-    cn = _CARD_NUM_RE.search(raw)
-    if cn:
-        result["card_number"] = cn.group(1)
-        result["confidence"]["card_number"] = 1.0
-        norm = norm.replace(cn.group(0).lower(), "")
-    else:
-        result["confidence"]["card_number"] = 0.0
-
-    # Grading (PSA 10, BGS 9.5 etc)
-    g = _GRADING_RE.search(raw)
-    if g:
-        result["grading"] = g.group(1).upper()
-        try:
-            result["grade"] = float(g.group(2))
-        except:
-            result["grade"] = None
-        result["confidence"]["grading"] = 1.0
-        norm = norm.replace(g.group(0).lower(), "")
-    else:
-        g2 = _GRADING_ONLY_RE.search(raw)
-        if g2:
-            result["grading"] = g2.group(1).upper()
-            result["confidence"]["grading"] = 0.8
-            norm = norm.replace(g2.group(0).lower(), "")
-        else:
-            result["confidence"]["grading"] = 0.0
-
-    # Autograph
-    is_auto = any(tok in norm for tok in AUTOGRAPH_KEYWORDS)
-    result["autograph"] = bool(is_auto)
-    result["confidence"]["autograph"] = 0.95 if is_auto else 0.0
-    if is_auto:
-        for tok in AUTOGRAPH_KEYWORDS:
-            norm = norm.replace(tok, "")
-
-    # Relic/patch
-    is_relic = any(tok in norm for tok in RELIC_KEYWORDS)
-    result["relic_patch"] = bool(is_relic)
-    result["confidence"]["relic_patch"] = 0.95 if is_relic else 0.0
-    if is_relic:
-        for tok in RELIC_KEYWORDS:
-            norm = norm.replace(tok, "")
-
-    # Language
-    found_lang = None
-    for k, v in LANGUAGE_MAP.items():
-        if k in norm:
-            found_lang = v
-            norm = norm.replace(k, "")
-            break
-    result["language"] = found_lang
-    result["confidence"]["language"] = 0.9 if found_lang else 0.0
-
-    # Rarity & Parallel
-    found_rarity = None
-    for r in RARITY_KEYWORDS:
-        if r in norm:
-            found_rarity = r
-            norm = norm.replace(r, "")
-            break
-    result["rarity"] = found_rarity
-    result["confidence"]["rarity"] = 0.95 if found_rarity else 0.0
-
-    found_parallel = None
-    for p in PARALLEL_KEYWORDS:
-        if p in norm:
-            found_parallel = p
-            norm = norm.replace(p, "")
-            break
-    result["parallel"] = found_parallel
-    result["confidence"]["parallel"] = 0.95 if found_parallel else 0.0
-
-    # Set detection: first exact substring match, then fuzzy match
-    found_set = None
-    set_score = 0.0
-
-    # Try direct substring matching first (more precise)
-    for set_name in set_names:
-        if set_name.lower() in norm:
-            found_set = set_name
-            set_score = 1.0
-            norm = norm.replace(set_name.lower(), "")
-            break
-
-    # If no direct match, try fuzzy matching with lower threshold
-    if not found_set:
-        best_name, score = _fuzzy_best_match(norm, set_names)
-        if best_name and score >= fuzzy_threshold:
-            found_set = best_name
-            set_score = score / 100.0
-            norm = norm.replace(best_name.lower(), "")
-        else:
-            set_score = score / 100.0 if best_name else 0.0
-
-    result["set"] = found_set
-    result["set_score"] = set_score
-    result["confidence"]["set"] = set_score
-
-    # Player/character extraction: leftover tokens after removals
-    leftovers = re.sub(
-        r"\b(card|cards|pokemon|pokémon|mtg|yugioh|yu gi oh|yugi)\b", " ", norm
-    )
-    leftovers = re.sub(r"[^a-z0-9 ]", " ", leftovers)
-    leftovers = re.sub(r"\s+", " ", leftovers).strip()
-    result["player_or_character"] = leftovers.title() if leftovers else None
-    result["confidence"]["player_or_character"] = 0.9 if leftovers else 0.0
-
-    # ensure normalized_title updated
-    result["normalized_title"] = _normalize_text(result["raw_title"])
-
-    return result
-
-
-# ===============================================================
-# OpenAI config
-# ===============================================================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_BASE = os.getenv("OPENAI_BASE", "https://api.openai.com")
-EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
-RERANK_MODEL = os.getenv("OPENAI_RERANK_MODEL", "gpt-4o-mini")
-EMBED_BATCH = int(os.getenv("EMBED_BATCH", "128"))
-
-
-# ===============================================================
-# Helper: compute cosine similarity
-# ===============================================================
-
-
-def _cosine_sim(a: list[float], b: list[float]) -> float:
-    # returns similarity in [-1..1]
-    if not a or not b or len(a) != len(b):
-        return -1.0
-    # compute dot / (||a|| * ||b||)
-    dot = 0.0
-    na = 0.0
-    nb = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        na += x * x
-        nb += y * y
-    if na == 0 or nb == 0:
-        return -1.0
-    return dot / (math.sqrt(na) * math.sqrt(nb))
-
-
-# ===============================================================
-# OpenAI helpers (async)
-# ===============================================================
-
-
-async def _openai_post(
-    path: str, payload: dict[str, any], timeout: int = 30
-) -> dict[str, any]:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not set")
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    url = OPENAI_BASE.rstrip("/") + path
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        return r.json()
-
-
-# ===============================================================
-# Embed texts using OpenAI
-# ===============================================================
-
-
-async def embed_texts(texts: list[str], model: str = None) -> list[list[float]]:
-    model = model or EMBED_MODEL
-    if not texts:
+def extract_year_range(text: str) -> list[str]:
+    # extract year pattern at the start, can be 1994 or 1994-96
+    m = re.match(r"(\d{4})(?:-(\d{2,4}))?", text)
+    if not m:
         return []
-    # OpenAI embeddings endpoint
-    # Batch sizes handled by caller
-    payload = {"model": model, "input": texts}
-    data = await _openai_post("/v1/embeddings", payload, timeout=60)
-    # data['data'] -> list of dicts {embedding: [...], index: i}
-    return [item["embedding"] for item in data.get("data", [])]
+
+    start = int(m.group(1))
+    end_str = m.group(2)
+
+    if end_str:
+        if len(end_str) == 2:
+            end = int(str(start)[:2] + end_str)
+        else:
+            end = int(end_str)
+        return [str(y) for y in range(start, end + 1)]
+    else:
+        return [str(start)]
 
 
 # ===============================================================
-# GPT rerank prompt
+# Upsert card_sets (supabase)
 # ===============================================================
+async def upsert_card_sets(card_sets: list[dict[str, any]]) -> dict[str, any]:
+    """
+    Upsert card_sets into supabase table `card_sets`.
+    Return:
+      {
+        "count": int,            # number of records returned by supabase (accumulated)
+        "records": List[Dict],   # list of returned representations
+        "errors": List[str]      # errors, if any
+      }
+    """
+    results = {"count": 0, "records": [], "errors": []}
+    if not card_sets:
+        return results
+
+    try:
+        db_records = []
+        for card_set in card_sets:
+            db_record = {
+                "name": card_set.get("name", ""),
+                "category_id": card_set.get("category_id", ""),
+                "platform": card_set.get("platform", ""),
+                "platform_set_id": card_set.get("platform_set_id", ""),
+                "years": card_set.get("years", []),
+                "link": card_set.get("link", ""),
+                "browse_type": card_set.get("browse_type", ""),
+            }
+            db_records.append(db_record)
+
+        # upsert in batches, accumulate returned representations
+        BATCH = 500
+        for i in range(0, len(db_records), BATCH):
+            batch = db_records[i : i + BATCH]
+            resp = (
+                supabase.table("card_sets")
+                .upsert(
+                    batch, on_conflict="platform_set_id", returning="representation"
+                )
+                .execute()
+            )
+            batch_records = resp.data or []
+            results["records"].extend(batch_records)
+            results["count"] += len(batch_records)
+
+        scraper_logger.info(f"✅ Upserted {results['count']} sets to card_sets")
+        return results
+    except Exception as e:
+        results["errors"].append(str(e))
+        scraper_logger.error(f"❌ Failed to upsert card_sets: {e}")
+        return results
 
 
-async def gpt_rerank_prompt(
-    prompt: str, model: str = None, max_tokens: int = 512
-) -> str:
-    model = model or RERANK_MODEL
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
-        "max_tokens": max_tokens,
-    }
-    data = await _openai_post("/v1/chat/completions", payload, timeout=60)
-    return data["choices"][0]["message"]["content"]
+# ===============================================================
+# Upsert master_cards (supabase)
+# ===============================================================
+async def upsert_master_cards(cards: list[dict[str, any]]) -> dict[str, any]:
+    """
+    Upsert cards into supabase table `master_cards`.
+    Return structure same as upsert_card_sets: {count, records, errors}
+    """
+    results = {"count": 0, "records": [], "errors": []}
+    if not cards:
+        return results
+
+    try:
+        db_records = []
+        for card in cards:
+            years = card.get("years", []) or []
+            db_record = {
+                "category_id": card.get("category_id", ""),
+                "set_id": card.get("set_id", ""),
+                "platform": card.get("platform", ""),
+                "platform_card_id": card.get("platform_card_id", ""),
+                "name": card.get("name", ""),
+                "card_number": card.get("card_number", ""),
+                "canonical_image_url": card.get("canonical_image_url", ""),
+                "link": card.get("link", ""),
+                "attributes": card.get("attributes", {}),
+                "years": years,
+                "year": years[0] if years else None,
+            }
+            db_records.append(db_record)
+
+        # upsert in batches, accumulate returned representations
+        BATCH = 500
+        for i in range(0, len(db_records), BATCH):
+            batch = db_records[i : i + BATCH]
+            resp = (
+                supabase.table("master_cards")
+                .upsert(
+                    batch, on_conflict="platform_card_id", returning="representation"
+                )
+                .execute()
+            )
+            batch_records = resp.data or []
+            results["records"].extend(batch_records)
+            results["count"] += len(batch_records)
+
+        scraper_logger.info(f"✅ Upserted {results['count']} cards to master_cards")
+        return results
+    except Exception as e:
+        results["errors"].append(str(e))
+        scraper_logger.error(f"❌ Failed to upsert master_cards: {e}")
+        return results
 
 
 # ===============================================================
 # Get HTML Content
 # ===============================================================
-
-
 async def scrape_ebay_html(
     region: Region,
     query: str | None = None,
@@ -451,10 +164,16 @@ async def scrape_ebay_html(
     page_retries: int = 3,
     disable_proxy: bool = False,
 ) -> list[str]:
+    scraper_logger.info(
+        f"[scrape_ebay_html] params: query={query}, category_id={category_id}, card_id={card_id}"
+    )
     # (same logic as before) - build config, request first page to determine total pages, loop pages
-    final_query = query or "card"
+    final_query = query
     final_category_id = category_id
 
+    # -----------------------------------------------
+    # Mode: card_id
+    # -----------------------------------------------
     if card_id:
         try:
             response = (
@@ -466,22 +185,24 @@ async def scrape_ebay_html(
             )
             if response.data:
                 card_data = response.data[0]
-                final_query = card_data.get("canonical_title") or "card"
+                final_query = card_data.get("canonical_title")
                 final_category_id = (
                     CategoryId(card_data.get("category_id"))
                     if card_data.get("category_id")
                     else None
                 )
                 scraper_logger.info(
-                    f"✅ Mode 2: Using card_id - query: '{final_query}'"
+                    f"✅ [Scraping Mode: card_id] ------------------------------------"
                 )
         except Exception as e:
-            scraper_logger.warning(
-                f"⚠️ Error resolving card_id {card_id}: {e}"
-            )
-
+            scraper_logger.warning(f"⚠️ Error resolving card_id {card_id}: {e}")
+    # -----------------------------------------------
+    # Mode: query + category_id
+    # -----------------------------------------------
     if query and category_id:
-        scraper_logger.info(f"✅ Mode 1: Using direct query: '{query}'")
+        scraper_logger.info(
+            f"✅ [Scraping Mode:] ------------------ query + category_id ------------------"
+        )
 
     config = {
         "query": final_query,
@@ -491,48 +212,51 @@ async def scrape_ebay_html(
     }
 
     total_pages = 1
-    try:
-        params = {
-            "_nkw": config["query"],
-            "_sacat": "0",
-            "_from": "R40",
-            "rt": "nc",
-            "LH_Sold": "1",
-            "LH_Complete": "1",
-            "Country/Region of Manufacture": (
-                "United Kingdom" if config["region_str"] == "uk" else "United States"
-            ),
-            "_ipg": "240",
-            "_pgn": "1",
-            "_sop": "12",
-        }
-        scraper_logger.info(
-            f"📡 Scraping eBay URL: {config['base_url']}?{urlencode(params)}"
-        )
-        html = await httpx_get_content(
-            config["base_url"], params=params, use_proxy=not disable_proxy
-        )
-        if html:
-            soup = BeautifulSoup(html, "html.parser")
-            count_element = soup.select_one(
-                ".srp-controls__count-heading, .result-count__count-heading"
+    if max_pages > 1:
+        try:
+            params = {
+                "_nkw": config["query"],
+                "_sacat": "0",
+                "_from": "R40",
+                "rt": "nc",
+                "LH_Sold": "1",
+                "LH_Complete": "1",
+                "Country/Region of Manufacture": (
+                    "United Kingdom"
+                    if config["region_str"] == "uk"
+                    else "United States"
+                ),
+                "_ipg": "240",
+                "_pgn": "1",
+                "_sop": "12",
+            }
+            scraper_logger.info(
+                f"📡 [Scraping eBay start] with query --- {config['base_url']}?{urlencode(params)}"
             )
-            if count_element:
-                bold = count_element.find("span", class_="BOLD")
-                text = (
-                    bold.get_text(strip=True)
-                    if bold
-                    else count_element.get_text(" ", strip=True)
+            html = await httpx_get_content(
+                config["base_url"], params=params, use_proxy=not disable_proxy
+            )
+            if html:
+                soup = BeautifulSoup(html, "html.parser")
+                count_element = soup.select_one(
+                    ".srp-controls__count-heading, .result-count__count-heading"
                 )
-                match = re.search(r"(\d[\d,]*)", text)
-                if match:
-                    total_results = int(match.group(1).replace(",", ""))
-                    total_pages = max(1, math.ceil(total_results / 240))
-    except Exception as e:
-        scraper_logger.warning(f"⚠️ Error getting page count: {e}")
+                if count_element:
+                    bold = count_element.find("span", class_="BOLD")
+                    text = (
+                        bold.get_text(strip=True)
+                        if bold
+                        else count_element.get_text(" ", strip=True)
+                    )
+                    match = re.search(r"(\d[\d,]*)", text)
+                    if match:
+                        total_results = int(match.group(1).replace(",", ""))
+                        total_pages = max(1, math.ceil(total_results / 240))
+        except Exception as e:
+            scraper_logger.warning(f"⚠️ Error getting page count: {e}")
 
     total_pages = min(max_pages, total_pages)
-    scraper_logger.info(f"🚀 Scraping {total_pages} pages for query: '{final_query}'")
+    scraper_logger.info(f"🚀 [Scraping {total_pages} pages] ---- '{final_query}'")
 
     html_pages = []
     for page in range(1, total_pages + 1):
@@ -559,15 +283,18 @@ async def scrape_ebay_html(
                     ),
                     "_ipg": "240",
                     "_pgn": str(page),
-                    "_sop": "13",
+                    "_sop": "12",
                 }
+                scraper_logger.info(
+                    f"📡 [eBay URL] --- {config['base_url']}?{urlencode(params)}"
+                )
                 timeout = random.uniform(12.0, 18.0)
                 jitter_min = random.uniform(0.5, 1.2)
                 jitter_max = random.uniform(1.5, 3.0)
                 page_html = await httpx_get_content(
                     config["base_url"],
                     params=params,
-                    attempts=5,
+                    attempts=2,
                     request_timeout=timeout,
                     jitter_min=jitter_min,
                     jitter_max=jitter_max,
@@ -591,8 +318,6 @@ async def scrape_ebay_html(
 # ===============================================================
 # Extract Ebay HTML content to data
 # ===============================================================
-
-
 async def extract_ebay_post_data(
     html_pages: list[str], region: str, category_id: int | None = None
 ) -> list[dict[str, any]]:
@@ -699,71 +424,21 @@ async def extract_ebay_post_data(
                             dt = dt if dt.tzinfo else tz.localize(dt)
                             sold_date = dt.isoformat()
                         except Exception:
-                            sold_date = datetime.utcnow().isoformat()
+                            sold_date = None
                 if not sold_date:
-                    sold_date = datetime.utcnow().isoformat()
-
-                # --- Step 1: Normalize title (deterministic + fuzzy) ---
-                norm_attrs = normalize_card_title(title)
-
-                # build tags & top-level compat fields
-                condition = "graded" if norm_attrs.get("grading") else "raw"
-                grading_company = norm_attrs.get("grading")
-                grade = norm_attrs.get("grade")
-                normalized_name = norm_attrs.get("normalized_title") or ""
-
-                # tags: set, player tokens, rarity, parallel
-                tags = []
-                if norm_attrs.get("set"):
-                    tags.append(norm_attrs["set"].lower())
-                if norm_attrs.get("player_or_character"):
-                    tags.extend(
-                        [w.lower() for w in norm_attrs["player_or_character"].split()][
-                            :6
-                        ]
-                    )
-                if norm_attrs.get("rarity"):
-                    tags.append(norm_attrs["rarity"].lower())
-                if norm_attrs.get("parallel"):
-                    tags.append(norm_attrs["parallel"].lower())
-                # dedupe & limit
-                seen = set()
-                clean_tags = []
-                for t in tags:
-                    if not t or t in seen:
-                        continue
-                    seen.add(t)
-                    clean_tags.append(t)
-                    if len(clean_tags) >= 8:
-                        break
-                tags = clean_tags
+                    sold_date = None
 
                 post_data: dict[str, any] = {
                     "id": listing_id,
                     "title": title,
                     "image_url": image_url,
                     "image_hd_url": image_hd_url,
-                    # top-level compatibility
-                    "condition": condition,
-                    "grading_company": grading_company,
-                    "grade": grade,
-                    "normalised_name": normalized_name,
-                    # nested metadata
-                    "metadata": {
-                        "condition": condition,
-                        "grading_company": grading_company,
-                        "grade": grade,
-                        "region": region,
-                        "category_id": category_id,
-                        "normalized_name": normalized_name,
-                        "tags": tags,
-                        "normalized_attributes": norm_attrs,
-                    },
+                    "normalized_title": title.lower(),
                     "sold_date": sold_date,
                     "sold_price": price,
                     "sold_currency": currency,
                     "sold_post_url": url,
-                    "embedding": None,  # Will be filled in Step 2
+                    "embedding": None,  # Will be filled in next step
                 }
 
                 all_posts.append(post_data)
@@ -788,316 +463,34 @@ async def extract_ebay_post_data(
 
 
 # ===============================================================
-# Add Embeddings to Posts
+# Update user card with selected post
 # ===============================================================
-
-
-async def embed_posts(
-    posts: list[dict[str, any]], batch_size: int = EMBED_BATCH
-) -> None:
-    if not posts:
-        return
-
-    model = EMBED_MODEL
-    texts = [p["metadata"]["normalized_attributes"]["normalized_title"] for p in posts]
-    embeddings: list[list[float]] = []
-    # batch
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        try:
-            embs = await embed_texts(batch, model=model)
-            embeddings.extend(embs)
-        except Exception as e:
-            scraper_logger.error(f"❌ Embedding batch failed: {e}")
-            # fallback: fill batch with None
-            embeddings.extend([None] * len(batch))
-    # attach embeddings to posts
-    for p, emb in zip(posts, embeddings):
-        p["embedding"] = emb
-
-    return posts
-
-
-# ===============================================================
-# Selection Last Sold By AI (Post Ranking)
-# ===============================================================
-
-
-async def select_best_ebay_post(
-    posts: list[dict[str, any]],
-    user_query: str,
-    top_k: int = 5,
-    rerank_with_gpt: bool = True,
-) -> dict[str, any] | None:
-    """Select best eBay post using precise attribute matching + embedding similarity."""
-    if not posts:
-        return None
-
-    scraper_logger.info(f"🎯 Starting selection from {len(posts)} posts...")
-
-    # Normalize user query to extract attributes
-    user_attrs = normalize_card_title(user_query)
-    # scraper_logger.info(f"🔍 Extracted user attributes: {user_attrs}")
-
-    # Extract exact match criteria from user_attrs
-    user_year = user_attrs.get("year")
-    user_set = user_attrs.get("set")
-    user_player = user_attrs.get("player_or_character")
-
-    # Filter posts that match exactly on year, set, and player (if they are specified)
-    filtered_posts = []
-    for post in posts:
-        post_attrs = post.get("metadata", {}).get("normalized_attributes", {})
-        # Check year
-        if user_year is not None and post_attrs.get("year") != user_year:
-            continue
-        # Check set
-        if user_set is not None and post_attrs.get("set") != user_set:
-            continue
-        # Check player/character
-        if (
-            user_player is not None
-            and post_attrs.get("player_or_character") != user_player
-        ):
-            continue
-        filtered_posts.append(post)
-
-    # If no posts match the exact criteria, fall back to all posts
-    if not filtered_posts:
+async def update_card(
+    selected_post: dict[str, any], gpt_reason: str, card_id: str
+) -> dict[str, any]:
+    results = {"card_updated": False, "errors": []}
+    try:
+        update_data = {
+            "last_sold_post_url": selected_post.get("sold_post_url"),
+            "last_sold_price": selected_post.get("sold_price"),
+            "last_sold_currency": selected_post.get("sold_currency"),
+            "last_sold_at": selected_post.get("sold_date"),
+            "last_sold_debug": gpt_reason,
+        }
+        supabase.table("cards").update(update_data).eq("id", card_id).execute()
+        results["card_updated"] = True
         scraper_logger.info(
-            "No exact matches found for year, set, and player. Falling back to all posts."
+            f"✅ Updated card {card_id}: price={selected_post.get('sold_price')} {selected_post.get('sold_currency')}"
         )
-        filtered_posts = posts
-    else:
-        scraper_logger.info(
-            f"Filtered to {len(filtered_posts)} posts with exact matches for year, set, and player."
-        )
-
-    # Limit posts to prevent timeout (take first 100 for efficiency)
-    if len(filtered_posts) > 100:
-        scraper_logger.info(f"⚡ Limiting to first 100 posts for efficiency")
-        filtered_posts = filtered_posts[:100]
-
-    # Score posts using attribute matching + embedding similarity
-    scored = []
-    for i, post in enumerate(filtered_posts):
-        post_attrs = post.get("metadata", {}).get("normalized_attributes", {})
-
-        # Calculate attribute match score (0-1)
-        attr_score = _calculate_attribute_match_score(user_attrs, post_attrs)
-
-        # Calculate embedding similarity (0-1)
-        embed_score = 0.0
-        if post.get("embedding"):
-            q_norm = user_attrs.get("normalized_title", user_query)
-            q_emb = (await embed_texts([q_norm]))[0]
-            embed_score = _cosine_sim(q_emb, post["embedding"])
-
-        # Combined score: 80% attribute matching + 20% embedding similarity
-        final_score = (attr_score * 0.8) + (embed_score * 0.2)
-
-        scored.append((post, final_score, attr_score, embed_score))
-
-    if not scored:
-        return None
-
-    # Sort by combined score and take top-k
-    scored.sort(key=lambda x: x[1], reverse=True)
-    top_posts = scored[:top_k]
-
-    # Optional GPT reranking for close matches
-    best_post, best_score, best_attr, best_embed = top_posts[0]
-    if rerank_with_gpt and len(top_posts) > 1 and best_score < 0.9:
-        candidates_text = "\n".join(
-            [
-                f"{i+1}. {post['title']} - {post['sold_price']} {post['sold_currency']} (attr:{attr:.2f}, embed:{embed:.2f})"
-                for i, (post, _, attr, embed) in enumerate(top_posts)
-            ]
-        )
-
-        prompt = f"""
-        User is looking for: {user_query}
-        
-        Top candidates with scores:
-        {candidates_text}
-        
-        Return the number (1-{len(top_posts)}) of the best match as JSON: {{"choice": N}}
-        """
-
-        try:
-            gpt_out = await gpt_rerank_prompt(prompt)
-            if isinstance(gpt_out, dict) and "choice" in gpt_out:
-                choice_idx = int(gpt_out["choice"]) - 1
-                if 0 <= choice_idx < len(top_posts):
-                    best_post, best_score, best_attr, best_embed = top_posts[choice_idx]
-        except:
-            scraper_logger.warning(
-                "⚠️ GPT rerank failed, using attribute-based selection"
-            )
-
-    return {
-        "found": True,
-        "match": {
-            "title": best_post.get("title", ""),
-            "sold_price": best_post.get("sold_price"),
-            "sold_currency": best_post.get("sold_currency"),
-            "sold_post_url": best_post.get("sold_post_url"),
-            "sold_at": best_post.get("sold_at"),
-            "similarity": best_score,
-            "attribute_score": best_attr,
-            "embedding_score": best_embed,
-            "metadata": best_post.get("metadata", {}),
-        },
-        "debug_info": {
-            "top_k_scores": [
-                (p["title"], score, attr, embed) for p, score, attr, embed in top_posts
-            ],
-            "total_candidates": len(scored),
-            "user_attributes": user_attrs,
-        },
-    }
+    except Exception as e:
+        results["errors"].append(str(e))
+        scraper_logger.error(f"❌ Failed update cards: {e}")
+    return results
 
 
 # ===============================================================
-# Attribute Matching
+# upsert ebay_posts (supabase)
 # ===============================================================
-
-
-def _calculate_attribute_match_score(
-    user_attrs: dict[str, any], post_attrs: dict[str, any]
-) -> float:
-    """Calculate precise attribute match score between user query and post."""
-    score = 0.0
-    total_weight = 0.0
-
-    # Player/Character matching - 50% weight (HIGHEST PRIORITY - must match player)
-    if user_attrs.get("player_or_character") and post_attrs.get("player_or_character"):
-        user_player = user_attrs["player_or_character"].lower()
-        post_player = post_attrs["player_or_character"].lower()
-
-        # Extract key names (ignoring numbers/grades) - minimum 3 characters
-        user_names = [w for w in user_player.split() if w.isalpha() and len(w) >= 3]
-        post_names = [w for w in post_player.split() if w.isalpha() and len(w) >= 3]
-
-        if user_names and post_names:
-            # Require exact name matches (not substring matches)
-            name_matches = sum(1 for name in user_names if name in post_names)
-
-            # Only give score if we have significant name overlap
-            if len(user_names) >= 2:  # Full names (first + last)
-                # Require both first and last name to match for full score
-                if name_matches >= 2:
-                    score += 0.5  # Full player name match
-                elif name_matches == 1:
-                    score += 0.2  # Partial match for one name
-                # No score if no names match
-            else:  # Single name
-                if name_matches > 0:
-                    score += 0.5
-        total_weight += 0.5
-
-    # Set matching - 25% weight
-    if user_attrs.get("set") and post_attrs.get("set"):
-        if user_attrs["set"].lower() == post_attrs["set"].lower():
-            score += 0.25
-        total_weight += 0.25
-    elif user_attrs.get("set"):  # User has set but post doesn't
-        total_weight += 0.25  # Penalty for missing set
-
-    # Year/Date matching - 15% weight
-    user_year = _extract_year(user_attrs.get("normalized_title", ""))
-    post_year = _extract_year(post_attrs.get("normalized_title", ""))
-    if user_year and post_year:
-        if user_year == post_year:
-            score += 0.15
-        elif abs(int(user_year) - int(post_year)) <= 1:  # Allow 1 year difference
-            score += 0.075
-        total_weight += 0.15
-
-    # Serial number/Card number matching - 15% weight
-    user_serial = _extract_serial_number(user_attrs.get("normalized_title", ""))
-    post_serial = _extract_serial_number(post_attrs.get("normalized_title", ""))
-    if user_serial and post_serial:
-        if user_serial.lower() == post_serial.lower():
-            score += 0.15
-        elif user_serial.replace("/", "").replace("#", "") == post_serial.replace(
-            "/", ""
-        ).replace("#", ""):
-            score += 0.1  # Partial match for format differences
-        total_weight += 0.15
-
-    # Return normalized score
-    return score / total_weight if total_weight > 0 else 0.0
-
-
-# ===============================================================
-# Helper Functions
-# ===============================================================
-
-
-def _extract_year(text: str) -> str | None:
-    """Extract year from card title, handling season ranges like 2024-25."""
-    import re
-
-    # Look for 4-digit years or year ranges like 2024, 2023/24, 2022-23
-    # Always return the first (main) year from ranges
-    year_match = re.search(r"(20\d{2})(?:[/-]\d{2})?", text)
-    return year_match.group(1) if year_match else None
-
-
-def _extract_year_range(text: str) -> list[str]:
-    # extract year pattern at the start, can be 1994 or 1994-96
-    m = re.match(r"(\d{4})(?:-(\d{2,4}))?", text)
-    if not m:
-        return []
-
-    start = int(m.group(1))
-    end_str = m.group(2)
-
-    if end_str:
-        if len(end_str) == 2:
-            end = int(str(start)[:2] + end_str)
-        else:
-            end = int(end_str)
-        return [str(y) for y in range(start, end + 1)]
-    else:
-        return [str(start)]
-
-
-def _extract_serial_number(text: str) -> str | None:
-    """Extract serial number like /25, #123, 048/299, avoiding year ranges like 2024-25."""
-    import re
-
-    # Look for patterns like /25, #123, 048/299, etc.
-    # But avoid year ranges like 2024-25, 2023-24
-    serial_patterns = [
-        r"(?<!20\d{2}[-/])/(\d+)",  # /25 but not after year like 2024-25
-        r"#(\d+)",  # #123
-        r"(\d{3}/\d+)",  # 048/299
-        r"(?<!20\d{2})(\d{1,2}/\d+)",  # 12/50 but not after 4-digit year
-    ]
-
-    for pattern in serial_patterns:
-        match = re.search(pattern, text)
-        if match:
-            captured = match.group(1)
-            # Additional check: if it looks like a year range (specifically XX-YY or XX/YY where XX is a 4-digit year), skip it
-            # But don't skip legitimate serial numbers like /25, #25 etc.
-            year_range_context = re.search(
-                r"(20\d{2})[-/]" + re.escape(captured) + r"\b", text
-            )
-            if year_range_context:
-                continue
-            return captured
-
-    return None
-
-
-# ===============================================================
-# Step 4: upsert ebay_posts (supabase) + update cards if card_id mode
-# ===============================================================
-
-
 async def upsert_ebay_listings(
     posts: list[dict[str, any]], card_id: str | None = None
 ) -> dict[str, any]:
@@ -1114,7 +507,7 @@ async def upsert_ebay_listings(
             db_id = post.get("title", "")[:50] + "_" + str(random.randint(1000, 9999))
             db_record = {
                 "id": db_id,
-                "name": post.get("title", ""),
+                "title": post.get("title", ""),
                 "image_url": post.get("image_url", ""),
                 "image_hd_url": post.get("image_hd_url", ""),
                 "region": post.get("metadata", {}).get("region", ""),
@@ -1127,23 +520,53 @@ async def upsert_ebay_listings(
                 "post_url": post.get("sold_post_url", ""),
                 "blocked": False,
                 "user_card_ids": [],
-                "normalised_name": post.get("normalised_name", ""),
+                "normalised_name": post.get("normalized_title", ""),
                 "category_id": post.get("metadata", {}).get("category_id"),
-                # embed vector into record (Supabase/Postgres vector column should accept array)
-                "embedding": post.get("embedding"),
-                # store structured attributes
-                "normalized_attributes": post.get("metadata", {}).get(
-                    "normalized_attributes", {}
-                ),
             }
             db_records.append(db_record)
-        # upsert in batches
+        # upsert in batches with robust fallback for missing columns
         BATCH = 500
         for i in range(0, len(db_records), BATCH):
             batch = db_records[i : i + BATCH]
-            supabase.table("ebay_posts").upsert(
-                batch, on_conflict="id", returning="minimal"
-            ).execute()
+
+            def _upsert_safe(recs: list[dict[str, any]]):
+                while True:
+                    try:
+                        supabase.table("ebay_posts").upsert(
+                            recs, on_conflict="id", returning="minimal"
+                        ).execute()
+                        return True
+                    except Exception as e:
+                        msg = str(e)
+                        # Example: Could not find the 'normalized_attributes' column of 'ebay_posts'
+                        m = re.search(r"Could not find the '([^']+)' column", msg)
+                        if m:
+                            missing_col = m.group(1)
+                            for r in recs:
+                                r.pop(missing_col, None)
+                            scraper_logger.warning(
+                                f"⚠️ Upsert retry: removed missing column '{missing_col}' from batch"
+                            )
+                            continue
+                        # Some Supabase clients return JSON dict-like errors; attempt to parse column name
+                        if "normalized_attributes" in msg:
+                            for r in recs:
+                                r.pop("normalized_attributes", None)
+                            scraper_logger.warning(
+                                "⚠️ Upsert retry: removed 'normalized_attributes' from batch"
+                            )
+                            continue
+                        if "embedding" in msg:
+                            for r in recs:
+                                r.pop("embedding", None)
+                            scraper_logger.warning(
+                                "⚠️ Upsert retry: removed 'embedding' from batch"
+                            )
+                            continue
+                        # If we cannot recover, re-raise
+                        raise
+
+            _upsert_safe(batch)
             results["upserted_count"] += len(batch)
         scraper_logger.info(
             f"✅ Upserted {results['upserted_count']} listings to ebay_posts"
@@ -1155,139 +578,348 @@ async def upsert_ebay_listings(
 
 
 # ===============================================================
-# Update user card with selected post
+# get card record by card_id (supabase)
 # ===============================================================
-
-
-async def update_card(
-    selected_post: dict[str, any], card_id: str
-) -> dict[str, any]:
-    results = {"card_updated": False, "errors": []}
+async def get_card(card_id: str) -> Optional[dict]:
     try:
-        update_data = {
-            "last_sold_post_url": selected_post.get("sold_post_url"),
-            "last_sold_price": selected_post.get("sold_price"),
-            "last_sold_currency": selected_post.get("sold_currency"),
-            "last_sold_at": selected_post.get("sold_date"),
-        }
-        supabase.table("cards").update(update_data).eq(
-            "id", card_id
-        ).execute()
-        results["card_updated"] = True
-        scraper_logger.info(
-            f"✅ Updated card {card_id}: price={selected_post.get('sold_price')} {selected_post.get('sold_currency')}"
+        resp = (
+            supabase.table("cards")
+            .select(
+                "canonical_title, years, card_set, name, variation, serial_number, number, grading_company, grade_number"
+            )
+            .eq("id", card_id)
+            .limit(1)
+            .execute()
         )
+        if resp.data:
+            return resp.data[0]
     except Exception as e:
-        results["errors"].append(str(e))
-        scraper_logger.error(f"❌ Failed update cards: {e}")
-    return results
+        scraper_logger.info(f"⚠️ Failed to resolve card: {e}")
+    return None
 
 
 # ===============================================================
-# Upsert card_sets (supabase)
+# Normalize text for comparison
 # ===============================================================
-# NOTE: this module expects `supabase` client to be available (same as project).
-# Upsert functions now return a dict with explicit 'count' and 'records'.
-async def upsert_card_sets(card_sets: list[dict[str, any]]) -> dict[str, any]:
+def normalized_text(val: Any) -> Optional[str]:
+    if not val or val == "":
+        return None
+    return str(val).strip().lower()
+
+
+# ===============================================================
+# word_match
+# ===============================================================
+def word_match(
+    title: Optional[str],
+    filter: Optional[str],
+    word_threshold: Optional[int] = None,
+) -> bool:
+    """Return True if title matches filter using token and fuzzy checks with count-based threshold.
+
+    - title: text to search within (can be None; treated as empty string)
+    - filter: space-delimited string of tokens to check (None/empty => False)
+    - word_threshold: minimum number of tokens/phrases that must match (>= 1). If None or > token count, require all tokens.
+
+    Special rules:
+    - Tokens are split on whitespace and evaluated independently (even single-character tokens like "1").
+    - Use RapidFuzz per token as a flexible fallback (no static alias expansions).
     """
-    Upsert card_sets into supabase table `card_sets`.
-    Return:
-      {
-        "count": int,            # number of records returned by supabase (accumulated)
-        "records": List[Dict],   # list of returned representations
-        "errors": List[str]      # errors, if any
-      }
+    if not filter:
+        return True
+    # Normalize title
+    title_text = (title or "").lower().strip()
+    filter_text = str(filter).lower().strip()
+    # Build collapsed variants to catch cases like 'logo fractor' vs 'logofractor' or 'logo-fractor'
+    title_collapsed = title_text.replace(" ", "")
+    filter_collapsed = filter_text.replace(" ", "")
+    # Alphanumeric-only squeeze (remove all non a-z0-9)
+    title_squeezed = re.sub(r"[^a-z0-9]+", "", title_text)
+    filter_squeezed = re.sub(r"[^a-z0-9]+", "", filter_text)
+    # Tokenize the filter on whitespace; do not merge short tokens
+    tokens = [t for t in filter_text.split() if t]
+    if not tokens:
+        return False
+
+    token_count = len(tokens)
+    # Compute required matches based on word_threshold (default: require all)
+    required = (
+        token_count
+        if not word_threshold or word_threshold <= 0
+        else min(word_threshold, token_count)
+    )
+
+    # 1) If requiring all tokens, allow an early perfect whole-string equality
+    if required == token_count:
+        if fuzz.token_set_ratio(title_text, filter_text) >= 100:
+            return True
+        if fuzz.token_set_ratio(title_collapsed, filter_collapsed) >= 100:
+            return True
+        if fuzz.token_set_ratio(title_squeezed, filter_squeezed) >= 100:
+            return True
+
+    # 2) Count token coverage (exact or fuzzy) for tokens
+    matched = 0
+    fuzzy_token_min_ratio = 80  # fixed per-token fuzzy similarity threshold
+    for t in tokens:
+        tc = t.replace(" ", "")
+        ts = re.sub(r"[^a-z0-9]+", "", t)
+        if t in title_text or tc in title_collapsed or ts in title_squeezed:
+            matched += 1
+            continue
+        # last resort fuzzy per-token when available
+        if (
+            fuzz.partial_ratio(t, title_text) >= fuzzy_token_min_ratio
+            or fuzz.partial_ratio(tc, title_collapsed) >= fuzzy_token_min_ratio
+            or fuzz.partial_ratio(ts, title_squeezed) >= fuzzy_token_min_ratio
+        ):
+            matched += 1
+
+    return matched >= required
+
+
+# ===============================================================
+# Helper functions to check if all required attributes are matched
+# ===============================================================
+def all_present_matched(
+    attribute_filters: List[str], req: List[str], matched: Dict[str, bool]
+) -> bool:
+    filtered_req = [k for k in req if k in attribute_filters]
+    return all(matched.get(k, False) for k in filtered_req)
+
+
+# ===============================================================
+# Build strict promisable candidates
+# ===============================================================
+def build_strict_promisable_candidates(
+    attribute_filters: Dict[str, Any],
+    posts: List[Dict],
+) -> Dict[str, List[Dict]]:
+    low_req = ["years", "name"]
+    med_req = ["years", "card_set", "name"]
+    high_req = ["years", "card_set", "name", "variation"]
+
+    # -----------------------------------------------------------
+    # Normalize card-side values once
+    # -----------------------------------------------------------
+    unmatch_posts: List[Dict] = []
+    match_posts: List[Dict] = []
+    # Debug counters
+    low_cnt = med_cnt = high_cnt = unmatch_cnt = fallback_cnt = 0
+
+    # Log incoming filters once for debugging
+    try:
+        dbg_filters = {
+            k: v
+            for k, v in attribute_filters.items()
+            if k
+            in ["years", "card_set", "name", "variation", "serial_number", "number"]
+        }
+        scraper_logger.info(
+            f"[build_candidates] filters: {json.dumps(dbg_filters, ensure_ascii=False)}"
+        )
+    except Exception:
+        pass
+
+    card_years = normalized_text(attribute_filters.get("years", ""))
+    card_set = normalized_text(attribute_filters.get("card_set", ""))
+    card_name = normalized_text(attribute_filters.get("name", ""))
+    card_variation = normalized_text(attribute_filters.get("variation", ""))
+    card_serial = normalized_text(attribute_filters.get("serial_number", ""))
+    card_number = normalized_text(attribute_filters.get("number", ""))
+    # card_grading = normalized_text(attribute_filters.get("grading_company", ""))
+    # card_grade = normalized_text(attribute_filters.get("grade_number", ""))
+
+    # print(f"card_years: {card_years}")
+    # print(f"card_set: {card_set}")
+    # print(f"card_name: {card_name}")
+    # print(f"card_variation: {card_variation}")
+    # print(f"card_serial: {card_serial}")
+    # print(f"card_number: {card_number}")
+    # print(f"card_grading: {card_grading}")
+    # print(f"card_grade: {card_grade}")
+
+    for ebay_post in posts:
+        # -----------------------------------------------------------
+        # Post normalization helpers
+        # -----------------------------------------------------------
+        title = ebay_post.get("normalized_title")
+        matched = {
+            # Years: match any of the provided years (threshold=1)
+            "years": word_match(title, card_years, 1),
+            "card_set": word_match(title, card_set, 2),
+            "name": word_match(title, card_name),
+            "variation": word_match(title, card_variation, 0),
+            "serial_number": word_match(title, card_serial),
+            "number": word_match(title, card_number),
+            # "grading_company": word_match(title, card_grading),
+            # "grade_number": word_match(title, card_grade),
+        }
+
+        if all_present_matched(attribute_filters, low_req, matched):
+            matched["candidate_score"] = "low"
+            low_cnt += 1
+        elif all_present_matched(attribute_filters, med_req, matched):
+            matched["candidate_score"] = "medium"
+            med_cnt += 1
+        elif all_present_matched(attribute_filters, high_req, matched):
+            matched["candidate_score"] = "high"
+            high_cnt += 1
+        else:
+            matched["candidate_score"] = "unmatch"
+            unmatch_cnt += 1
+
+        ebay_post["matched"] = matched
+
+        if matched["candidate_score"] == "unmatch":
+            # Fallback: allow GPT to refine when set+name look good, even if year is missing
+            if matched.get("card_set") and matched.get("name"):
+                matched["candidate_score"] = "fallback"
+                match_posts.append(ebay_post)
+                fallback_cnt += 1
+            else:
+                unmatch_posts.append(ebay_post)
+        else:
+            match_posts.append(ebay_post)
+
+    # Log summary counts and up to 5 sample unmatches for diagnosis
+    try:
+        scraper_logger.info(
+            f"[build_candidates] counts -> low={low_cnt}, med={med_cnt}, high={high_cnt}, fallback={fallback_cnt}, unmatch={unmatch_cnt}"
+        )
+        if unmatch_cnt and len(unmatch_posts) > 0:
+            sample = []
+            for p in unmatch_posts[:5]:
+                sample.append(
+                    {
+                        "title": p.get("normalized_title") or p.get("title"),
+                        "matched": p.get("matched"),
+                    }
+                )
+            # scraper_logger.info(
+            #     f"[build_candidates] unmatch_sample: {json.dumps(sample, ensure_ascii=False)}"
+            # )
+    except Exception:
+        pass
+
+    return {"unmatch_posts": unmatch_posts, "match_posts": match_posts}
+
+
+# ===============================================================
+# GPT selection using model gpt-4o-mini
+# ===============================================================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_BASE = os.getenv("OPENAI_BASE", "https://api.openai.com")
+GPT_MODEL = os.getenv("OPENAI_RERANK_MODEL", "gpt-4o-mini")
+
+
+async def select_best_candidate_with_gpt(
+    canonical_title: Optional[str],
+    match_posts: List[Dict],
+) -> Optional[Dict]:
+    """Return the single best candidate (full post) chosen by GPT and finalized by most recent sold_date.
+
+    Flow:
+    - Build a compact list from ALL `match_posts` for GPT (index + id + titles).
+    - GPT returns indices of likely matches.
+    - Map indices back to `match_posts` to obtain the candidate list.
+    - Print the compact entries for the selected indices for debugging.
+    - Choose the most recent by sold_date and return that single post.
     """
-    results = {"count": 0, "records": [], "errors": []}
-    if not card_sets:
-        return results
+    if len(match_posts) == 0:
+        scraper_logger.info("❌ No match posts found; selection returns None")
+        return None
+
+    compact: List[Dict] = []
+    for idx, match_post in enumerate(match_posts):
+        compact.append(
+            {
+                "i": idx,  # index used for selection
+                "id": match_post.get("id"),
+                "raw": str(match_post.get("title")),
+                "normalized": str(match_post.get("normalized_title")),
+            }
+        )
+
+    scraper_logger.info(f"[compact count before send] --- {len(compact)} posts")
+    scraper_logger.info("--------------------------------------")
+
+    system_prompt = (
+        "You are an EXPERT trading-card matcher. Decide whether each candidate refers to the SAME underlying card as the canonical title. Apply these principles: "
+        "1) Core identity is defined by: product line/set/series + subject (player/character/team/item/trainer/stadium) + card number when provided. "
+        "2) Normalize case, punctuation, hyphens, common abbreviations, and spacing; treat equivalent naming and order-insensitive wording as the same. "
+        "3) Set/product line must be the same family (brand + series). Different product lines are NOT matches. "
+        "4) If the canonical includes a card number, prefer candidates with the same number; ignore '#' and leading zeros and tolerate separators. If a candidate shows a different number, EXCLUDE it. "
+        "5) Year is informative but NOT required; do not exclude solely for missing/different year when the core identity matches. "
+        "6) Variations/parallels: When the canonical specifies a specific variant (color/finish/parallel/print-run, autograph, memorabilia, promo/pre-release), EXCLUDE candidates that explicitly state a different variant. When the canonical is silent, ACCEPT base and minor surface-finish variants typical to the product line; treat grading as non-identity. "
+        "7) Quantity/lot terms (e.g., playset, x2/x4, set of N) do not alter identity—do not exclude for quantity alone. "
+        "8) Ignore boilerplate (game/sport name, generic words like 'card', condition terms) unless they convey identity (e.g., team vs player). "
+        "Return a JSON object: {matches: [indices], reason: string}. Include indices only when the core identity rules are satisfied. If none qualify, return an empty list and briefly explain why."
+    )
+
+    user_prompt = {
+        "canonical_title": canonical_title or "",
+        "candidates": compact,
+        "instructions": (
+            "Compare 'canonical_title' with each candidate using both 'raw' and 'normalized' titles. "
+            "Include an index ONLY IF the core identity matches: same product line/set/series (semantic family), same subject (player/character/team/item/trainer/stadium), and — when the canonical provides it — the same card number (ignoring '#', leading zeros, and separators). "
+            "Year is optional. If the canonical specifies a particular variant, exclude candidates explicitly stating a different variant; otherwise accept typical minor finish variants for the product line. Quantity/lot terms do not affect identity. "
+            "Treat serial/print-run and grading as informative signals but not strictly required unless mismatched values change identity. "
+            'Return JSON: {"matches": [i1, i2, ...], "reason": <string>}. If none qualify, leave matches empty and provide a concise reason (e.g., set mismatch, different variant, number mismatch, uncertain identity).'
+        ),
+    }
 
     try:
-        db_records = []
-        for card_set in card_sets:
-            db_record = {
-                "name": card_set.get("name", ""),
-                "category_id": card_set.get("category_id", ""),
-                "platform": card_set.get("platform", ""),
-                "platform_set_id": card_set.get("platform_set_id", ""),
-                "years": card_set.get("years", []),
-                "link": card_set.get("link", ""),
-                "browse_type": card_set.get("browse_type", ""),
-            }
-            db_records.append(db_record)
+        url = OPENAI_BASE.rstrip("/") + "/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": GPT_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_prompt)},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+        content = data["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+        scraper_logger.info(f"[GPT response] --- {content}")
+        idxs = parsed.get("matches", [])
 
-        # upsert in batches, accumulate returned representations
-        BATCH = 500
-        for i in range(0, len(db_records), BATCH):
-            batch = db_records[i : i + BATCH]
-            resp = (
-                supabase.table("card_sets")
-                .upsert(
-                    batch, on_conflict="platform_set_id", returning="representation"
-                )
-                .execute()
-            )
-            batch_records = resp.data or []
-            results["records"].extend(batch_records)
-            results["count"] += len(batch_records)
+        selected_indices: List[int] = [
+            i for i in idxs if isinstance(i, int) and 0 <= i < len(match_posts)
+        ]
 
-        scraper_logger.info(f"✅ Upserted {results['count']} sets to card_sets")
-        return results
+        selected_posts: List[Dict] = [match_posts[i] for i in selected_indices]
+
+        def sold_ts(p: Dict) -> float:
+            d = p.get("sold_date") or p.get("sold_at") or ""
+            try:
+                return date_parser.parse(d, fuzzy=True).timestamp()
+            except Exception:
+                return 0.0
+
+        scraper_logger.info("--------------------------------------")
+        scraper_logger.info(
+            f"[candidates] --- {json.dumps(selected_posts, indent=4, ensure_ascii=False)}"
+        )
+
+        last_sold_post = max(selected_posts, key=sold_ts)
+        return {
+            "last_sold_post": last_sold_post,
+            "reason": parsed.get("reason"),
+        }
     except Exception as e:
-        results["errors"].append(str(e))
-        scraper_logger.error(f"❌ Failed to upsert card_sets: {e}")
-        return results
-
-
-# ===============================================================
-# Upsert master_cards (supabase)
-# ===============================================================
-async def upsert_master_cards(cards: list[dict[str, any]]) -> dict[str, any]:
-    """
-    Upsert cards into supabase table `master_cards`.
-    Return structure same as upsert_card_sets: {count, records, errors}
-    """
-    results = {"count": 0, "records": [], "errors": []}
-    if not cards:
-        return results
-
-    try:
-        db_records = []
-        for card in cards:
-            years = card.get("years", []) or []
-            db_record = {
-                "category_id": card.get("category_id", ""),
-                "set_id": card.get("set_id", ""),
-                "platform": card.get("platform", ""),
-                "platform_card_id": card.get("platform_card_id", ""),
-                "name": card.get("name", ""),
-                "card_number": card.get("card_number", ""),
-                "canonical_image_url": card.get("canonical_image_url", ""),
-                "link": card.get("link", ""),
-                "attributes": card.get("attributes", {}),
-                "years": years,
-                "year": years[0] if years else None,
-            }
-            db_records.append(db_record)
-
-        # upsert in batches, accumulate returned representations
-        BATCH = 500
-        for i in range(0, len(db_records), BATCH):
-            batch = db_records[i : i + BATCH]
-            resp = (
-                supabase.table("master_cards")
-                .upsert(
-                    batch, on_conflict="platform_card_id", returning="representation"
-                )
-                .execute()
-            )
-            batch_records = resp.data or []
-            results["records"].extend(batch_records)
-            results["count"] += len(batch_records)
-
-        scraper_logger.info(f"✅ Upserted {results['count']} cards to master_cards")
-        return results
-    except Exception as e:
-        results["errors"].append(str(e))
-        scraper_logger.error(f"❌ Failed to upsert master_cards: {e}")
-        return results
+        scraper_logger.info(f"⚠️ GPT selection failed: {e}")
+        try:
+            scraper_logger.info(f"gpt_error: {str(e)}")
+        except Exception:
+            pass
+        return None

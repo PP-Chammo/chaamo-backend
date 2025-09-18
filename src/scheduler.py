@@ -154,7 +154,6 @@ async def _execute_single_scrape(config: Dict, index: int, total: int, logger) -
             query=query,
             category_id=category_id,
             max_pages=10,
-            page_retries=3,
         )
 
         count = result.get("total", 0)

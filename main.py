@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
         ensure_playwright_browsers()
     else:
         scheduler_logger.info("Skipping Playwright setup in production environment")
-    scheduler_logger.info("Starting eBay cronjob scheduler...")
+    scheduler_logger.info("🕒 Starting eBay cronjob scheduler...")
     start_ebay_cronjob()
     yield
     # Shutdown
@@ -58,7 +58,7 @@ def health_check():
 # debug purpose, because in render.com swagger cant be load
 try:
     app.openapi()
-    api_logger.info("OpenAPI schema generated successfully")
+    api_logger.info("🤖 OpenAPI schema generated successfully")
 except Exception as e:
     api_logger.exception("Failed to generate OpenAPI schema: %s", e)
 

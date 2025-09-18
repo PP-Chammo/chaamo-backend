@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 import httpx
 
-from src.utils.logger import get_logger
+from src.utils.logger import get_logger, httpx_logger
 
 logger = get_logger("httpx")
 
@@ -20,6 +20,7 @@ load_dotenv()
 
 # Disable verbose httpx logging to prevent spam
 import logging
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Modern browser user agents for anti-bot measures
@@ -53,8 +54,7 @@ ZYTE_API_KEY = os.environ.get("ZYTE_API_ACCESS")
 ZYTE_PROXY_URL = os.environ.get("ZYTE_PROXY_URL")
 
 # Elite proxy servers - tested and working for eBay scraping
-PROXY_LIST = [
-]
+PROXY_LIST = []
 
 DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -114,7 +114,7 @@ def get_zyte_proxy() -> Optional[str]:
     if not ZYTE_API_KEY:
         logger.warning("🔑 Zyte API key not found in environment")
         return None
-    
+
     # Zyte proxy format: http://api_key:@api.zyte.com:8011/
     return f"http://{ZYTE_API_KEY}:@{ZYTE_PROXY_URL}/"
 
@@ -179,6 +179,7 @@ async def httpx_get_content(
         await asyncio.sleep(random.uniform(0.5, 1.2))
 
     from src.utils.logger import setup_logger
+
     logger = setup_logger("chaamo.httpx")
 
     # Try proxy first with SSL fallback strategy
@@ -191,15 +192,16 @@ async def httpx_get_content(
             connection_attempts.append(("zyte_ssl", zyte_proxy))
             # Then try Zyte without SSL verification
             connection_attempts.append(("zyte_no_ssl", zyte_proxy))
-            logger.info("🟢 Using Zyte proxy with SSL fallback strategy")
         else:
             # Fallback to traditional proxies
             proxy_url = get_random_proxy()
+            connection_attempts.append(("direct", None))
             if proxy_url:
                 connection_attempts.append(("proxy", proxy_url))
             elif not PROXY_LIST:  # If proxy list is empty, fallback to direct
-                connection_attempts.append(("direct", None))
-                logger.info("🔄 Proxy list is empty, using direct connection fallback")
+                httpx_logger.info(
+                    "🔄 Proxy list is empty, using direct connection fallback"
+                )
 
     # Always add direct connection as final fallback
     connection_attempts.append(("direct", None))
@@ -207,13 +209,13 @@ async def httpx_get_content(
     for connection_type, proxy_config in connection_attempts:
         # Log connection attempt
         if connection_type == "zyte_ssl":
-            logger.info("🔐 Trying Zyte proxy with SSL verification")
+            httpx_logger.info("🔐 [Use Zyte] --- with SSL verification")
         elif connection_type == "zyte_no_ssl":
-            logger.info("🔓 Trying Zyte proxy without SSL verification")
+            httpx_logger.info("🔓 [Use Zyte] --- without SSL verification")
         elif connection_type == "proxy":
-            logger.info(f"🌐 Trying traditional proxy: {proxy_config}")
+            httpx_logger.info(f"🌐 [Use Proxy] --- {proxy_config}")
         else:
-            logger.info(f"🔗 Trying direct connection")
+            logger.info(f"🔗 [Use Direct] ---")
 
         use_http2 = bool(random.getrandbits(1))
         limits = httpx.Limits(
@@ -224,17 +226,19 @@ async def httpx_get_content(
             # Configure SSL verification and proxy settings
             verify_ssl = False
             proxy_setting = None
-            
+
             if connection_type == "zyte_ssl":
                 # Zyte proxy with SSL verification enabled
-                verify_ssl = "/usr/local/share/ca-certificates/zyte-ca.crt" if os.path.exists("/usr/local/share/ca-certificates/zyte-ca.crt") else True
+                verify_ssl = (
+                    "/usr/local/share/ca-certificates/zyte-ca.crt"
+                    if os.path.exists("/usr/local/share/ca-certificates/zyte-ca.crt")
+                    else True
+                )
                 proxy_setting = proxy_config
-                logger.info("🔐 Using SSL verification for Zyte proxy")
             elif connection_type == "zyte_no_ssl":
                 # Zyte proxy with SSL verification disabled
                 verify_ssl = False
                 proxy_setting = proxy_config
-                logger.info("🔓 Disabling SSL verification for Zyte proxy")
             elif connection_type == "proxy":
                 # Traditional proxy without SSL verification
                 verify_ssl = False
@@ -262,7 +266,9 @@ async def httpx_get_content(
             continue
 
     # If all connection attempts failed
-    logger.error("❌ All connection attempts failed (Zyte SSL -> Zyte no-SSL -> Direct)")
+    logger.error(
+        "❌ All connection attempts failed (Zyte SSL -> Zyte no-SSL -> Direct)"
+    )
     return ""
 
 
@@ -360,7 +366,7 @@ async def _attempt_requests(client, url, params, headers, attempts, connection_t
             )
 
             if is_challenge:
-                logger.warning(
+                logger.info(
                     f"⚠️ Detected challenge/redirect page, retrying with new session (attempt {attempt})"
                 )
                 headers["User-Agent"] = random.choice(USER_AGENTS)
@@ -382,21 +388,19 @@ async def _attempt_requests(client, url, params, headers, attempts, connection_t
             return text
 
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ProxyError):
-            logger.warning(
-                f"⚠️ Connection/Proxy error on attempt {attempt}, retrying..."
-            )
+            logger.info(f"⚠️ Connection/Proxy error on attempt {attempt}, retrying...")
             await asyncio.sleep(0.5 * attempt + random.uniform(0.1, 0.5))
             continue
         except httpx.HTTPStatusError as e:
             if e.response.status_code in (403, 429):
-                logger.warning(
+                logger.info(
                     f"⚠️ HTTP {e.response.status_code} error, waiting before retry..."
                 )
                 await asyncio.sleep(1.0 * attempt + random.uniform(0.2, 0.6))
                 continue
             raise
         except httpx.NetworkError as e:
-            logger.warning(f"⚠️ Network error: {e}, retrying...")
+            logger.info(f"⚠️ Zyte SSL error: retrying...")
             await asyncio.sleep(0.5 * attempt + random.uniform(0.2, 0.8))
             continue
 

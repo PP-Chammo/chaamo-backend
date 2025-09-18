@@ -1,25 +1,22 @@
 import uuid
-from datetime import datetime
-from typing import Dict, Optional, Any
-from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
+from typing import Dict, Optional, Any
+from datetime import datetime
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 
 from src.utils.logger import scraper_logger
 from src.models.category import CategoryId
 from src.models.ebay import Region
-from src.utils.supabase import supabase
 from src.utils.scraper import (
     scrape_ebay_html,
-    embed_posts,
     extract_ebay_post_data,
-    select_best_ebay_post,
-    upsert_ebay_listings,
     update_card,
+    upsert_ebay_listings,
+    get_card,
+    build_strict_promisable_candidates,
+    select_best_candidate_with_gpt,
 )
-
-# use global scraper_logger from utils.logger
-
 
 # --------------------------
 # Main Handler
@@ -35,53 +32,27 @@ class EbayScraper:
         category_id: Optional[CategoryId] = None,
         card_id: Optional[str] = None,
         max_pages: int = 50,
-        page_retries: int = 3,
         disable_proxy: bool = False,
-        rerank_with_gpt: bool = True,
-        top_k: int = 5,
     ) -> Dict[str, Any]:
-        """
-        Full pipeline:
-        - Step 1: scrape & normalize
-        - Step 2: embed posts
-        - Step 3: nn + optional gpt rerank (if card_id provided we pick best)
-        - Step 4: store vectors + upsert posts, update card if applied
-        """
         try:
-            # resolve card query early
-            resolved_query = query or "card"
-            if card_id:
-                try:
-                    resp = (
-                        supabase.table("cards")
-                        .select("canonical_title, category_id")
-                        .eq("id", card_id)
-                        .limit(1)
-                        .execute()
-                    )
-                    if resp.data:
-                        resolved_query = (
-                            resp.data[0].get("canonical_title") or resolved_query
-                        )
-                except Exception as e:
-                    scraper_logger.warning(f"⚠️ Failed to resolve card: {e}")
-
             # ===============================================================
             # Step 1: Scrape Ebay html
             # ===============================================================
-
             html_pages = await scrape_ebay_html(
                 region=region,
+                # mode: query + category_id
                 query=query,
                 category_id=category_id,
+                # mode: card_id
                 card_id=card_id,
                 max_pages=max_pages,
-                page_retries=page_retries,
                 disable_proxy=disable_proxy,
             )
 
             if not html_pages:
-                return {"total": 0, "result": []}
+                scraper_logger.error(
+                    f'❌ failed fetch ebay results for query: ------ "{query}"'
+                )
 
             # ===============================================================
             # Step 2: Extract data from HTML
@@ -94,68 +65,82 @@ class EbayScraper:
             )
 
             # ===============================================================
-            # Step 3: Add Embedding into extracted data
+            # Step 3: Store ebay listings into supabase tables ebay_posts
             # ===============================================================
 
-            await embed_posts(posts)
+            upsert_results = await upsert_ebay_listings(posts, card_id=card_id)
 
             # ===============================================================
-            # Step 4: Pick best post using NN + optional GPT rerank
+            # Step 3 (card_id mode only): Building a "promisable candidates" list by strictly matching all non-null fields with medium/high proofs
             # ===============================================================
 
-            selected_post_info = None
             if card_id:
-                selected_post_info = await select_best_ebay_post(
-                    posts, resolved_query, top_k=top_k, rerank_with_gpt=rerank_with_gpt
+
+                selected_card = await get_card(card_id)
+                attribute_filters = {k: v for k, v in selected_card.items() if v}
+                # Normalize years without splitting into characters
+                try:
+                    years_val = selected_card.get("years") if selected_card else None
+                    if isinstance(years_val, (list, tuple, set)):
+                        yf = " ".join(str(y) for y in years_val if y)
+                        if yf:
+                            attribute_filters["years"] = yf
+                    elif years_val is not None:
+                        attribute_filters["years"] = str(years_val)
+                    # else: do not force-add years
+                except Exception:
+                    # On any failure, fall back to removing malformed years to avoid over-filtering
+                    attribute_filters.pop("years", None)
+
+                candidates_result = build_strict_promisable_candidates(
+                    attribute_filters=attribute_filters,
+                    posts=posts,
+                )
+                match_posts = candidates_result.get("match_posts", [])
+                # unmatch_posts = candidates_result.get("unmatch_posts", [])
+
+                # ===============================================================
+                # Step 4 (card_id mode only): Selecting the best candidate using GPT
+                # ===============================================================
+                best_matched_post = None
+                last_sold_post = await select_best_candidate_with_gpt(
+                    canonical_title=(
+                        selected_card.get("canonical_title") if selected_card else None
+                    ),
+                    match_posts=match_posts,
                 )
 
-            # ===============================================================
-            # Step 5: Store vectors & posts into supabase tables ebay_posts
-            # ===============================================================
+                if last_sold_post:
+                    await update_card(
+                        selected_post=last_sold_post,
+                        card_id=card_id,
+                    )
+                    best_matched_post = last_sold_post
 
-            upsert_results = await upsert_ebay_listings(
-                posts, card_id=card_id
-            )
-
-            # ===============================================================
-            # Step 6: Update card using selected
-            # ===============================================================
-
-            user_update_results = {}
-            if (
-                card_id
-                and selected_post_info
-                and selected_post_info.get("found")
-                and selected_post_info.get("match")
-            ):
-                selected = selected_post_info["match"]
-
-                # ===============================================================
-                # Log selected item details
-                # ===============================================================
-
+                results = {
+                    "result_count": len(posts),
+                    "upsert_count": len(upsert_results),
+                    "best_matched_post": best_matched_post,
+                }
+                scraper_logger.info(f"[result count] --- {results['result_count']}")
+                scraper_logger.info(f"[upsert count] --- {results['upsert_count']}")
+                scraper_logger.info(f"[last sold post] --- {results['best_matched_post']}")
                 scraper_logger.info(
-                    f"🎯 Selected best match for card {card_id}:\n"
-                    f"   📝 Title: {selected.get('title')}\n"
-                    f"   💰 Price: {selected.get('sold_price')} {selected.get('sold_currency')}\n"
-                    f"   🔗 URL: {selected.get('sold_post_url')}\n"
-                    f"   📊 Similarity: {selected.get('similarity', 0):.4f}\n"
-                    f"   🏷️ Set: {selected.get('metadata', {}).get('normalized_attributes', {}).get('set', 'None')}"
+                    f"🎉 Scraping [card_id] completed: {len(posts)} posts processed"
                 )
+                return results
 
-                user_update_results = await update_card(selected, card_id)
-
-            results = {
-                "total": len(posts),
-                "result": posts,
-                "selected": selected_post_info,
-                "upsert_results": upsert_results,
-                "user_update_results": user_update_results,
-            }
-            scraper_logger.info(
-                f"🎉 Scraping pipeline completed: {len(posts)} posts processed"
-            )
-            return results
+            else:
+                results = {
+                    "result_count": len(posts),
+                    "upsert_count": len(upsert_results),
+                }
+                scraper_logger.info(f"result_count: {results['result_count']}")
+                scraper_logger.info(f"upsert_count: {results['upsert_count']}")
+                scraper_logger.info(
+                    f"🎉 Scraping [query + category_id] completed: {len(posts)} posts processed"
+                )
+                return results
 
         except Exception as e:
             scraper_logger.error(f"❌ Scraping failed: {e}")
@@ -173,9 +158,9 @@ class WorkerStatus(str, Enum):
 @dataclass
 class WorkerTask:
     id: str
-    query: str
+    query: Optional[str]
     region: str
-    category_id: int
+    category_id: Optional[int]
     status: WorkerStatus
     created_at: datetime
     card_id: Optional[str] = None
@@ -223,13 +208,13 @@ class EbayWorkerManager:
         max_pages: int = 50,
     ) -> WorkerTask:
         task_id = str(uuid.uuid4())
-        final_query = query or "card"
-        final_category_id = category_id or CategoryId.TOPPS
+        final_query = query
+        final_category_id = category_id
         task = WorkerTask(
             id=task_id,
             query=final_query,
             region=region.value,
-            category_id=final_category_id.value,
+            category_id=final_category_id.value if final_category_id else None,
             status=WorkerStatus.PENDING,
             created_at=datetime.utcnow(),
             card_id=card_id,
@@ -238,12 +223,37 @@ class EbayWorkerManager:
         self.active_tasks[task_id] = task
         return task
 
+    # API helpers used by src/api/v1/endpoint.py
+    def get_all_tasks(self) -> list[WorkerTask]:
+        """Return a list of all current tasks (pending/running/completed/failed)."""
+        return list(self.active_tasks.values())
+
+    def get_task_status(self, task_id: str) -> Optional[WorkerTask]:
+        """Return a single task by ID or None if not found."""
+        return self.active_tasks.get(task_id)
+
+    def cleanup_old_tasks(self, max_age_hours: int = 12) -> None:
+        """Remove completed tasks older than max_age_hours to avoid memory growth."""
+        from datetime import timedelta
+
+        cutoff = datetime.utcnow() - timedelta(hours=max_age_hours)
+        to_delete = [
+            tid
+            for tid, t in self.active_tasks.items()
+            if t.completed_at and t.completed_at < cutoff
+        ]
+        for tid in to_delete:
+            try:
+                del self.active_tasks[tid]
+            except KeyError:
+                pass
+
     async def _run_scrape_worker(
         self,
         task_id: str,
         region: Region,
-        category_id: CategoryId,
-        query: str,
+        category_id: Optional[CategoryId],
+        query: Optional[str],
         card_id: Optional[str],
         max_pages: int,
         master_card_id: Optional[str] = None,

@@ -62,10 +62,11 @@ class ColorFormatter(logging.Formatter):
         "worker": "⚙️",
         "scraper": "🔍",
         "api": "🌐",
-        "database": "💾",
         "scheduler": "⏰",
         "paypal": "💰",
         "proxy": "🔄",
+        "httpx": "✈️ ",
+        "supabase": "💾",
     }
 
     def format(self, record):
@@ -82,7 +83,7 @@ class ColorFormatter(logging.Formatter):
         component_emoji = ""
         for component, comp_emoji in self.COMPONENT_EMOJIS.items():
             if component in record.name.lower():
-                component_emoji = f"{comp_emoji} "
+                component_emoji = f"{comp_emoji}"
                 break
 
         # Format timestamp
@@ -99,7 +100,7 @@ class ColorFormatter(logging.Formatter):
             f"{dim}[{timestamp}]{reset} "
             f"{emoji} {level_color}{bold}{level}{reset} "
             f"{dim}│{reset} "
-            f"{component_emoji}{bold}{logger_name:<12}{reset} "
+            f"{component_emoji} {bold}{logger_name:<12}{reset} "
             f"{dim}│{reset} "
             f"{record.getMessage()}"
         )
@@ -192,6 +193,8 @@ api_logger = setup_logger("chaamo.api")
 worker_logger = setup_logger("chaamo.worker")
 scraper_logger = setup_logger("chaamo.scraper")
 scheduler_logger = setup_logger("chaamo.scheduler")
+httpx_logger = setup_logger("chaamo.httpx")
+supabase_logger = setup_logger("chaamo.supabase")
 
 
 # Convenience helpers for explicit success/failure context
