@@ -29,6 +29,7 @@ from src.models.api import (
     ScrapeStartResponse,
 )
 from src.utils.logger import (
+    worker_logger,
     api_logger,
     log_api_request,
     log_worker_task,
@@ -137,7 +138,7 @@ async def start_scrape_worker(
                 manager._run_scrape_worker(
                     task.id,
                     region,
-                    CategoryId(task.category_id),
+                    CategoryId(task.category_id) if task.category_id else None,
                     task.query,
                     card_id,
                     max_pages,
@@ -145,17 +146,10 @@ async def start_scrape_worker(
                     disable_proxy,  # Pass disable_proxy parameter
                 )
             )
-            api_logger.info(f"⚙️ Worker task {task.id} started successfully")
+            worker_logger.info(f"[Worker task] {task.id} started successfully")
         except Exception as worker_error:
-            api_logger.error(f"❌ Failed to start worker: {worker_error}")
+            worker_logger.error(f"❌ Failed to start worker: {worker_error}")
             raise
-
-        log_worker_task(
-            api_logger,
-            task.id,
-            "created",
-            f"query='{task.query}' region={region.value}",
-        )
 
         return ScrapeStartResponse(
             task_id=task.id,
@@ -391,7 +385,9 @@ async def paypal_boost_post(
     user_id: str = Query(..., description="User ID (must be listing seller)"),
     listing_id: str = Query(..., description="Listing ID to boost"),
     plan_id: str = Query(..., description="Boost Plan ID"),
-    redirect: str = Query(..., description="App redirect deep link to return to after payment"),
+    redirect: str = Query(
+        ..., description="App redirect deep link to return to after payment"
+    ),
 ):
     return await paypal_boost_handler(
         request=request,
@@ -411,7 +407,9 @@ async def paypal_boost_return(
     user_id: str = Query(..., description="User ID"),
     listing_id: str = Query(..., description="Listing ID"),
     plan_id: str = Query(..., description="Boost Plan ID"),
-    subscription_id: Optional[str] = Query(None, description="PayPal subscription ID token"),
+    subscription_id: Optional[str] = Query(
+        None, description="PayPal subscription ID token"
+    ),
 ):
     return await paypal_boost_return_handler(
         redirect=redirect,

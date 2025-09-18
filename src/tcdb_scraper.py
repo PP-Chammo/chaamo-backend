@@ -5,7 +5,7 @@ from src.models.category import CategoryId
 from src.models.tcdb import BrowseDropdown
 from src.utils.playwright import playwright_get_content
 from src.utils.logger import scraper_logger
-from src.utils.scraper import _extract_year_range, upsert_card_sets, upsert_master_cards
+from src.utils.scraper import extract_year_range, upsert_card_sets, upsert_master_cards
 
 logger = scraper_logger
 
@@ -136,7 +136,7 @@ async def tcdb_scrape_handler(
 
                         seen_platform_set_ids.add(platform_set_id)
 
-                        years = _extract_year_range(name)
+                        years = extract_year_range(name)
 
                         if len(years) > 0 and years[0].isdigit():
                             year = int(years[0])
@@ -255,7 +255,7 @@ async def tcdb_scrape_handler(
                         continue
                     seen_platform_set_ids.add(platform_set_id)
 
-                    years = _extract_year_range(name)
+                    years = extract_year_range(name)
 
                     if len(years) > 0 and years[0].isdigit():
                         year = int(years[0])

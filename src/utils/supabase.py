@@ -32,8 +32,8 @@ def _create_supabase_client() -> Client:
     logger = setup_logger("chaamo.supabase")
 
     logger.info("🔧 Initializing Supabase connection...")
-    logger.info(f"   🌐 URL: {url}")
-    logger.info(f"   🔑 Key: {key[:20]}...")
+    logger.info(f"🌐 URL: {url}")
+    logger.info(f"🔑 Key: {key[:20]}...")
 
     try:
         client = create_client(url, key)
