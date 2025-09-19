@@ -112,7 +112,8 @@ class EbayScraper:
 
                 if last_sold_post:
                     await update_card(
-                        selected_post=last_sold_post,
+                        selected_post=last_sold_post.get("last_sold_post"),
+                        gpt_reason=last_sold_post.get("reason"),
                         card_id=card_id,
                     )
                     best_matched_post = last_sold_post

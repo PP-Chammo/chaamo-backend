@@ -503,10 +503,8 @@ async def upsert_ebay_listings(
     try:
         db_records = []
         for post in posts:
-            # generate deterministic-ish id if not present
-            db_id = post.get("title", "")[:50] + "_" + str(random.randint(1000, 9999))
             db_record = {
-                "id": db_id,
+                "id": post.get("id", ""),
                 "title": post.get("title", ""),
                 "image_url": post.get("image_url", ""),
                 "image_hd_url": post.get("image_hd_url", ""),
