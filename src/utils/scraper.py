@@ -424,7 +424,6 @@ async def extract_ebay_post_data(
         if url and url not in seen_urls:
             seen_urls.add(url)
             unique_posts.append(post)
-
     scraper_logger.info(
         f"📦 Extracted {len(unique_posts)} unique eBay post items (after normalization)"
     )
@@ -432,37 +431,9 @@ async def extract_ebay_post_data(
 
 
 # ===============================================================
-# Update user card with selected post
-# ===============================================================
-async def update_card(
-    selected_post: dict[str, any], gpt_reason: str, card_id: str
-) -> dict[str, any]:
-    results = {"card_updated": False, "errors": []}
-    try:
-        update_data = {
-            "last_sold_post_url": selected_post.get("sold_post_url"),
-            "last_sold_price": selected_post.get("sold_price"),
-            "last_sold_currency": selected_post.get("sold_currency"),
-            "last_sold_at": selected_post.get("sold_date"),
-            "last_sold_debug": gpt_reason,
-        }
-        supabase.table("cards").update(update_data).eq("id", card_id).execute()
-        results["card_updated"] = True
-        scraper_logger.info(
-            f"✅ Updated card {card_id}: price={selected_post.get('sold_price')} {selected_post.get('sold_currency')}"
-        )
-    except Exception as e:
-        results["errors"].append(str(e))
-        scraper_logger.error(f"❌ Failed update cards: {e}")
-    return results
-
-
-# ===============================================================
 # upsert ebay_posts (supabase)
 # ===============================================================
-async def upsert_ebay_listings(
-    posts: list[dict[str, any]]
-) -> dict[str, any]:
+async def upsert_ebay_listings(posts: list[dict[str, any]]) -> dict[str, any]:
     """
     Upsert posts into supabase table `ebay_posts` using the stored procedure fn_upsert_ebay_posts_with_counts.
     """
@@ -496,7 +467,9 @@ async def upsert_ebay_listings(
         for i in range(0, len(db_records), BATCH):
             json_batch = db_records[i : i + BATCH]
             try:
-                response = supabase.rpc("fn_upsert_ebay_posts_with_counts", {"data": json_batch}).execute()
+                response = supabase.rpc(
+                    "fn_upsert_ebay_posts_with_counts", {"data": json_batch}
+                ).execute()
 
                 if response.data and len(response.data) > 0:
                     row = response.data[0]
@@ -520,8 +493,15 @@ async def upsert_ebay_listings(
         monitor_data = supabase.table("monitor").select("*").eq("id", 1).execute()
         monitor_data = monitor_data.data[0]
         if monitor_data:
-            category_count = monitor_data.get(f"ebay_posts_category_{category_id}_count", 0)
-            supabase.table("monitor").update({f"ebay_posts_category_{category_id}_count": category_count + results["inserts_count"]}).eq("id", 1).execute()
+            category_count = monitor_data.get(
+                f"ebay_posts_category_{category_id}_count", 0
+            )
+            supabase.table("monitor").update(
+                {
+                    f"ebay_posts_category_{category_id}_count": category_count
+                    + results["inserts_count"]
+                }
+            ).eq("id", 1).execute()
 
     return results
 
@@ -731,26 +711,6 @@ def build_strict_promisable_candidates(
         else:
             match_posts.append(ebay_post)
 
-    # Log summary counts and up to 5 sample unmatches for diagnosis
-    try:
-        scraper_logger.info(
-            f"[build_candidates] counts -> low={low_cnt}, med={med_cnt}, high={high_cnt}, fallback={fallback_cnt}, unmatch={unmatch_cnt}"
-        )
-        if unmatch_cnt and len(unmatch_posts) > 0:
-            sample = []
-            for p in unmatch_posts[:5]:
-                sample.append(
-                    {
-                        "title": p.get("normalized_title") or p.get("title"),
-                        "matched": p.get("matched"),
-                    }
-                )
-            # scraper_logger.info(
-            #     f"[build_candidates] unmatch_sample: {json.dumps(sample, ensure_ascii=False)}"
-            # )
-    except Exception:
-        pass
-
     return {"unmatch_posts": unmatch_posts, "match_posts": match_posts}
 
 
@@ -797,12 +757,13 @@ async def select_best_candidate_with_gpt(
         "You are an EXPERT trading-card matcher. Decide whether each candidate refers to the SAME underlying card as the canonical title. Apply these principles: "
         "1) Core identity is defined by: product line/set/series + subject (player/character/team/item/trainer/stadium) + card number when provided. "
         "2) Normalize case, punctuation, hyphens, common abbreviations, and spacing; treat equivalent naming and order-insensitive wording as the same. "
-        "3) Set/product line must be the same family (brand + series). Different product lines are NOT matches. "
+        "3) Set/product line must be the same family (brand + series). Treat optional competition/region qualifiers (e.g., 'UCL', 'Champions League', 'EPL', 'La Liga', 'World Cup') as the SAME family when brand+series match; their presence/absence alone must not cause a set mismatch (e.g., 'Topps Now' ≈ 'UCL Topps Now'). Different product LINES (e.g., 'Topps Now' vs 'Topps Chrome/Sapphire/Museum Collection') are NOT matches. "
         "4) If the canonical includes a card number, prefer candidates with the same number; ignore '#' and leading zeros and tolerate separators. If a candidate shows a different number, EXCLUDE it. "
-        "5) Year is informative but NOT required; do not exclude solely for missing/different year when the core identity matches. "
+        "5) Year is informative but NOT required; treat 'YYYY' and 'YYYY-YY'/'YYYY-YYYY' season ranges as compatible when they overlap or share the start year (e.g., '2024' ≈ '2024-25'); do not exclude solely for that difference when core identity matches. "
         "6) Variations/parallels: When the canonical specifies a specific variant (color/finish/parallel/print-run, autograph, memorabilia, promo/pre-release), EXCLUDE candidates that explicitly state a different variant. When the canonical is silent, ACCEPT base and minor surface-finish variants typical to the product line; treat grading as non-identity. "
         "7) Quantity/lot terms (e.g., playset, x2/x4, set of N) do not alter identity—do not exclude for quantity alone. "
         "8) Ignore boilerplate (game/sport name, generic words like 'card', condition terms) unless they convey identity (e.g., team vs player). "
+        "9) Examples: Valid → '2024 Topps Now #12' vs '2024-25 UCL Topps Now #12' (same family + subject/number). Invalid → 'Topps Now' vs 'Topps Chrome #12' (different product lines). "
         "Return a JSON object: {matches: [indices], reason: string}. Include indices only when the core identity rules are satisfied. If none qualify, return an empty list and briefly explain why."
     )
 
@@ -812,7 +773,9 @@ async def select_best_candidate_with_gpt(
         "instructions": (
             "Compare 'canonical_title' with each candidate using both 'raw' and 'normalized' titles. "
             "Include an index ONLY IF the core identity matches: same product line/set/series (semantic family), same subject (player/character/team/item/trainer/stadium), and — when the canonical provides it — the same card number (ignoring '#', leading zeros, and separators). "
-            "Year is optional. If the canonical specifies a particular variant, exclude candidates explicitly stating a different variant; otherwise accept typical minor finish variants for the product line. Quantity/lot terms do not affect identity. "
+            "Treat competition/league qualifiers as optional ('UCL'/'Champions League', 'EPL', etc.): their presence or absence must NOT be considered a set mismatch when brand+series match (e.g., 'Topps Now' ≈ 'UCL Topps Now'). "
+            "Year is optional; regard 'YYYY' and 'YYYY-YY'/'YYYY-YYYY' seasons as compatible when overlapping or sharing a start year (e.g., '2024' ≈ '2024-25'). "
+            "If the canonical specifies a particular variant, exclude candidates explicitly stating a different variant; otherwise accept typical minor finish variants for the product line. Quantity/lot terms do not affect identity. "
             "Treat serial/print-run and grading as informative signals but not strictly required unless mismatched values change identity. "
             'Return JSON: {"matches": [i1, i2, ...], "reason": <string>}. If none qualify, leave matches empty and provide a concise reason (e.g., set mismatch, different variant, number mismatch, uncertain identity).'
         ),
@@ -860,7 +823,14 @@ async def select_best_candidate_with_gpt(
             f"[candidates] --- {json.dumps(selected_posts, indent=4, ensure_ascii=False)}"
         )
 
+        if not selected_posts:
+            return {
+                "last_sold_post": None,
+                "reason": parsed.get("reason"),
+            }
+
         last_sold_post = max(selected_posts, key=sold_ts)
+
         return {
             "last_sold_post": last_sold_post,
             "reason": parsed.get("reason"),
@@ -872,3 +842,35 @@ async def select_best_candidate_with_gpt(
         except Exception:
             pass
         return None
+
+
+# ===============================================================
+# Update user card with selected post
+# ===============================================================
+async def update_card(
+    selected_post: dict[str, any], gpt_reason: str, card_id: str
+) -> dict[str, any]:
+    results = {"card_updated": False, "errors": []}
+    try:
+        update_data = {
+            "last_sold_debug": gpt_reason,
+        }
+
+        if selected_post:
+            update_data = {
+                "last_sold_post_url": selected_post.get("post_url"),
+                "last_sold_price": selected_post.get("price"),
+                "last_sold_currency": selected_post.get("currency"),
+                "last_sold_at": selected_post.get("sold_at"),
+                "last_sold_debug": gpt_reason,
+            }
+
+        supabase.table("cards").update(update_data).eq("id", card_id).execute()
+        results["card_updated"] = True
+        scraper_logger.info(
+            f"✅ Updated card {card_id}: price={selected_post.get('price')} {selected_post.get('currency')}"
+        )
+    except Exception as e:
+        results["errors"].append(str(e))
+        scraper_logger.error(f"❌ Failed update cards: {e}")
+    return results

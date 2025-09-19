@@ -198,7 +198,7 @@ async def start_scrape_worker_get(
         category_id=category_id,
         query=query,
         card_id=card_id,
-        max_pages=max_pages,
+        max_pages=max_pages, #lock scraping max page from the app to 2 pages
         disable_proxy=disable_proxy,
         manager=manager,
     )

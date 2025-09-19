@@ -84,72 +84,68 @@ class EbayScraper:
             # Step 3 (card_id mode only): Building a "promisable candidates" list by strictly matching all non-null fields with medium/high proofs
             # ===============================================================
 
-            if card_id:
-
+            if mode == "card_id":
                 selected_card = await get_card(card_id)
                 attribute_filters = {k: v for k, v in selected_card.items() if v}
-                # Normalize years without splitting into characters
-                try:
-                    years_val = selected_card.get("years") if selected_card else None
-                    if isinstance(years_val, (list, tuple, set)):
-                        yf = " ".join(str(y) for y in years_val if y)
-                        if yf:
-                            attribute_filters["years"] = yf
-                    elif years_val is not None:
-                        attribute_filters["years"] = str(years_val)
-                    # else: do not force-add years
-                except Exception:
-                    # On any failure, fall back to removing malformed years to avoid over-filtering
-                    attribute_filters.pop("years", None)
+                attribute_filters["years"] = "-".join(attribute_filters.get("years", []))
 
                 candidates_result = build_strict_promisable_candidates(
                     attribute_filters=attribute_filters,
                     posts=posts,
                 )
                 match_posts = candidates_result.get("match_posts", [])
-                # unmatch_posts = candidates_result.get("unmatch_posts", [])
 
                 # ===============================================================
                 # Step 4 (card_id mode only): Selecting the best candidate using GPT
                 # ===============================================================
                 best_matched_post = None
-                last_sold_post = await select_best_candidate_with_gpt(
-                    canonical_title=(
-                        selected_card.get("canonical_title") if selected_card else None
-                    ),
-                    match_posts=match_posts,
-                )
+                reason = "ebay posts (after normalized) count 0 because not matched any post, cannot continue to select best candidate"
+                if len(match_posts) > 0:
+                    selection_result = await select_best_candidate_with_gpt(
+                        canonical_title=(
+                            selected_card.get("canonical_title") if selected_card else None
+                        ),
+                        match_posts=match_posts,
+                    )
 
-                if last_sold_post:
                     await update_card(
-                        selected_post=last_sold_post.get("last_sold_post"),
-                        gpt_reason=last_sold_post.get("reason"),
+                        selected_post=selection_result.get("last_sold_post", None),
+                        gpt_reason=selection_result.get("reason", None),
                         card_id=card_id,
                     )
-                    best_matched_post = last_sold_post
+                    best_matched_post = selection_result.get("last_sold_post")
+                    reason = selection_result.get("reason", reason)
 
                 results = {
                     "result_count": len(posts),
-                    "upsert_count": len(upsert_results),
+                    "upsert_count": upsert_results.get("inserts_count", 0) + upsert_results.get("updates_count", 0),
+                    "insert_count": upsert_results.get("inserts_count", 0),
+                    "update_count": upsert_results.get("updates_count", 0),
                     "best_matched_post": best_matched_post,
+                    "reason": reason,
                 }
+                scraper_logger.info(f"[selected last sold post] --- {json.dumps(results['best_matched_post'], indent=2, ensure_ascii=False)}")
+                scraper_logger.info(f"[reason] --- {results['reason']}")
                 scraper_logger.info(f"[result count] --- {results['result_count']}")
-                scraper_logger.info(f"[upsert count] --- {results['upsert_count']}")
-                scraper_logger.info(f"[last sold post] --- {json.dumps(results['best_matched_post'], indent=2, ensure_ascii=False)}")
+                scraper_logger.info(f"[insert count] --- {results['insert_count']}")
+                scraper_logger.info(f"[update count] --- {results['update_count']}")
                 scraper_logger.info(
-                    f"🎉 Scraping [card_id] completed: {len(posts)} posts processed"
+                    f"🎉 Scraping [{mode}] completed: {results['result_count']} posts processed"
                 )
                 return results
 
             else:
                 results = {
                     "result_count": len(posts),
-                    "upsert_count": len(upsert_results),
+                    "upsert_count": upsert_results.get("inserts_count", 0) + upsert_results.get("updates_count", 0),
+                    "insert_count": upsert_results.get("inserts_count", 0),
+                    "update_count": upsert_results.get("updates_count", 0),
                 }
-                scraper_logger.info(f"result_count: {results['result_count']}")
-                scraper_logger.info(f"upsert_count: {results['upsert_count']}")
+                scraper_logger.info(f"[result count] --- {results['result_count']}")
+                scraper_logger.info(f"[insert count] --- {results['insert_count']}")
+                scraper_logger.info(f"[update count] --- {results['update_count']}")
                 scraper_logger.info(
-                    f"🎉 Scraping [query + category_id] completed: {len(posts)} posts processed"
+                    f"🎉 Scraping [{mode}] completed: {results['result_count']} posts processed"
                 )
                 return results
 
