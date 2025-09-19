@@ -45,6 +45,54 @@ def extract_year_range(text: str) -> list[str]:
 
 
 # ===============================================================
+# Get correct category id by title
+# ===============================================================
+
+
+def get_correct_category_id(title: str) -> CategoryId:
+    if not title:
+        return CategoryId(99)
+
+    if any(keyword.lower() in title.lower() for keyword in CategoryId.get_keyword(12)):
+        return CategoryId(12).value
+
+    if any(keyword.lower() in title.lower() for keyword in CategoryId.get_keyword(11)):
+        return CategoryId(11).value
+
+    if any(keyword.lower() in title.lower() for keyword in CategoryId.get_keyword(10)):
+        return CategoryId(10).value
+
+    if any(keyword.lower() in title.lower() for keyword in CategoryId.get_keyword(9)):
+        return CategoryId(9).value
+
+    if any(keyword.lower() in title.lower() for keyword in CategoryId.get_keyword(8)):
+        return CategoryId(8).value
+
+    if any(keyword.lower() in title.lower() for keyword in CategoryId.get_keyword(7)):
+        return CategoryId(7).value
+
+    if any(keyword.lower() in title.lower() for keyword in CategoryId.get_keyword(6)):
+        return CategoryId(6).value
+
+    if any(keyword.lower() in title.lower() for keyword in CategoryId.get_keyword(5)):
+        return CategoryId(5).value
+
+    if any(keyword.lower() in title.lower() for keyword in CategoryId.get_keyword(4)):
+        return CategoryId(4).value
+
+    if any(keyword.lower() in title.lower() for keyword in CategoryId.get_keyword(3)):
+        return CategoryId(3).value
+
+    if any(keyword.lower() in title.lower() for keyword in CategoryId.get_keyword(2)):
+        return CategoryId(2).value
+
+    if any(keyword.lower() in title.lower() for keyword in CategoryId.get_keyword(1)):
+        return CategoryId(1).value
+
+    return CategoryId(99).value
+
+
+# ===============================================================
 # Upsert card_sets (supabase)
 # ===============================================================
 async def upsert_card_sets(card_sets: list[dict[str, any]]) -> dict[str, any]:
@@ -459,7 +507,9 @@ async def upsert_ebay_listings(posts: list[dict[str, any]]) -> dict[str, any]:
                 "post_url": post.get("post_url", ""),
                 "blocked": False,
                 "normalised_name": post.get("normalized_title", ""),
-                "category_id": post.get("category_id"),
+                "category_id": get_correct_category_id(
+                    post.get("normalized_title", "")
+                ),
             }
             db_records.append(db_record)
 
@@ -750,6 +800,7 @@ async def select_best_candidate_with_gpt(
             }
         )
 
+    scraper_logger.info(json.dumps(compact, indent=2, ensure_ascii=False))
     scraper_logger.info(f"[compact count before send] --- {len(compact)} posts")
     scraper_logger.info("--------------------------------------")
 

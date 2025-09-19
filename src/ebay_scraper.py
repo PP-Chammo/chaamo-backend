@@ -87,7 +87,8 @@ class EbayScraper:
             if mode == "card_id":
                 selected_card = await get_card(card_id)
                 attribute_filters = {k: v for k, v in selected_card.items() if v}
-                attribute_filters["years"] = "-".join(attribute_filters.get("years", []))
+                years = attribute_filters.get("years", [])
+                attribute_filters["years"] = f"{years[0]}-{years[1][-2:]}" if len(years) >= 2 else years[0] if years else ""
 
                 candidates_result = build_strict_promisable_candidates(
                     attribute_filters=attribute_filters,
