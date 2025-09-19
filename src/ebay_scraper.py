@@ -1,3 +1,4 @@
+import json
 import uuid
 from enum import Enum
 from typing import Dict, Optional, Any
@@ -17,6 +18,7 @@ from src.utils.scraper import (
     build_strict_promisable_candidates,
     select_best_candidate_with_gpt,
 )
+from src.utils.supabase import supabase_get_card
 
 # --------------------------
 # Main Handler
@@ -35,15 +37,23 @@ class EbayScraper:
         disable_proxy: bool = False,
     ) -> Dict[str, Any]:
         try:
+            mode = "query + category_id"
+
+            if card_id:
+                db_card = supabase_get_card({ "id": card_id })
+                if db_card:
+                    mode = "card_id"
+                    query = db_card.get("canonical_title")
+                    category_id = CategoryId(db_card.get("category_id"))
+
             # ===============================================================
             # Step 1: Scrape Ebay html
             # ===============================================================
             html_pages = await scrape_ebay_html(
                 region=region,
-                # mode: query + category_id
+                mode=mode,
                 query=query,
                 category_id=category_id,
-                # mode: card_id
                 card_id=card_id,
                 max_pages=max_pages,
                 disable_proxy=disable_proxy,
@@ -61,14 +71,14 @@ class EbayScraper:
             posts = await extract_ebay_post_data(
                 html_pages=html_pages,
                 region=region.value,
-                category_id=category_id.value if category_id else None,
+                category_id=category_id.value,
             )
 
             # ===============================================================
             # Step 3: Store ebay listings into supabase tables ebay_posts
             # ===============================================================
 
-            upsert_results = await upsert_ebay_listings(posts, card_id=card_id)
+            upsert_results = await upsert_ebay_listings(posts)
 
             # ===============================================================
             # Step 3 (card_id mode only): Building a "promisable candidates" list by strictly matching all non-null fields with medium/high proofs
@@ -125,7 +135,7 @@ class EbayScraper:
                 }
                 scraper_logger.info(f"[result count] --- {results['result_count']}")
                 scraper_logger.info(f"[upsert count] --- {results['upsert_count']}")
-                scraper_logger.info(f"[last sold post] --- {results['best_matched_post']}")
+                scraper_logger.info(f"[last sold post] --- {json.dumps(results['best_matched_post'], indent=2, ensure_ascii=False)}")
                 scraper_logger.info(
                     f"🎉 Scraping [card_id] completed: {len(posts)} posts processed"
                 )

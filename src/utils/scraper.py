@@ -157,6 +157,7 @@ async def upsert_master_cards(cards: list[dict[str, any]]) -> dict[str, any]:
 # ===============================================================
 async def scrape_ebay_html(
     region: Region,
+    mode: str,
     query: str | None = None,
     category_id: CategoryId | None = None,
     card_id: str | None = None,
@@ -165,48 +166,12 @@ async def scrape_ebay_html(
     disable_proxy: bool = False,
 ) -> list[str]:
     scraper_logger.info(
-        f"[scrape_ebay_html] params: query={query}, category_id={category_id}, card_id={card_id}"
+        f"✅ [Scraping Mode:] ------------------ {mode} ------------------"
     )
-    # (same logic as before) - build config, request first page to determine total pages, loop pages
-    final_query = query
-    final_category_id = category_id
-
-    # -----------------------------------------------
-    # Mode: card_id
-    # -----------------------------------------------
-    if card_id:
-        try:
-            response = (
-                supabase.table("cards")
-                .select("canonical_title, category_id")
-                .eq("id", card_id)
-                .limit(1)
-                .execute()
-            )
-            if response.data:
-                card_data = response.data[0]
-                final_query = card_data.get("canonical_title")
-                final_category_id = (
-                    CategoryId(card_data.get("category_id"))
-                    if card_data.get("category_id")
-                    else None
-                )
-                scraper_logger.info(
-                    f"✅ [Scraping Mode: card_id] ------------------------------------"
-                )
-        except Exception as e:
-            scraper_logger.warning(f"⚠️ Error resolving card_id {card_id}: {e}")
-    # -----------------------------------------------
-    # Mode: query + category_id
-    # -----------------------------------------------
-    if query and category_id:
-        scraper_logger.info(
-            f"✅ [Scraping Mode:] ------------------ query + category_id ------------------"
-        )
 
     config = {
-        "query": final_query,
-        "category_id": final_category_id.value if final_category_id else None,
+        "query": query,
+        "category_id": category_id.value if category_id else None,
         "region_str": region.value,
         "base_url": f"{base_target_url[region.value]}/sch/i.html",
     }
@@ -226,7 +191,7 @@ async def scrape_ebay_html(
                     if config["region_str"] == "uk"
                     else "United States"
                 ),
-                "_ipg": "240",
+                "_ipg": "10",
                 "_pgn": "1",
                 "_sop": "12",
             }
@@ -256,7 +221,7 @@ async def scrape_ebay_html(
             scraper_logger.warning(f"⚠️ Error getting page count: {e}")
 
     total_pages = min(max_pages, total_pages)
-    scraper_logger.info(f"🚀 [Scraping {total_pages} pages] ---- '{final_query}'")
+    scraper_logger.info(f"🚀 [Scraping {total_pages} pages] ---- '{query}'")
 
     html_pages = []
     for page in range(1, total_pages + 1):
@@ -427,18 +392,22 @@ async def extract_ebay_post_data(
                             sold_date = None
                 if not sold_date:
                     sold_date = None
-
                 post_data: dict[str, any] = {
                     "id": listing_id,
                     "title": title,
                     "image_url": image_url,
                     "image_hd_url": image_hd_url,
+                    "region": region,
+                    "sold_at": sold_date,
+                    "currency": currency,
+                    "price": price,
+                    "condition": "raw",
+                    "grading_company": "",
+                    "grade": 0,
+                    "post_url": url,
+                    "blocked": False,
                     "normalized_title": title.lower(),
-                    "sold_date": sold_date,
-                    "sold_price": price,
-                    "sold_currency": currency,
-                    "sold_post_url": url,
-                    "embedding": None,  # Will be filled in next step
+                    "category_id": category_id,
                 }
 
                 all_posts.append(post_data)
@@ -451,7 +420,7 @@ async def extract_ebay_post_data(
     seen_urls = set()
     unique_posts: list[dict[str, any]] = []
     for post in all_posts:
-        url = post.get("sold_post_url", "")
+        url = post.get("post_url", "")
         if url and url not in seen_urls:
             seen_urls.add(url)
             unique_posts.append(post)
@@ -492,15 +461,16 @@ async def update_card(
 # upsert ebay_posts (supabase)
 # ===============================================================
 async def upsert_ebay_listings(
-    posts: list[dict[str, any]], card_id: str | None = None
+    posts: list[dict[str, any]]
 ) -> dict[str, any]:
     """
-    Upsert posts into supabase table `ebay_posts`. If embedding present, store it in embedding column.
+    Upsert posts into supabase table `ebay_posts` using the stored procedure fn_upsert_ebay_posts_with_counts.
     """
-    results = {"upserted_count": 0, "errors": []}
+    results = {"inserts_count": 0, "updates_count": 0, "errors": []}
     if not posts:
         return results
     try:
+        category_id = posts[0].get("category_id")
         db_records = []
         for post in posts:
             db_record = {
@@ -508,70 +478,51 @@ async def upsert_ebay_listings(
                 "title": post.get("title", ""),
                 "image_url": post.get("image_url", ""),
                 "image_hd_url": post.get("image_hd_url", ""),
-                "region": post.get("metadata", {}).get("region", ""),
-                "sold_at": post.get("sold_date", ""),
-                "currency": post.get("sold_currency", "USD"),
-                "price": post.get("sold_price", ""),
+                "region": post.get("region", ""),
+                "sold_at": post.get("sold_at", ""),
+                "currency": post.get("currency", "USD"),
+                "price": post.get("price", ""),
                 "condition": post.get("condition", "raw"),
-                "grading_company": post.get("grading_company"),
-                "grade": post.get("grade"),
-                "post_url": post.get("sold_post_url", ""),
+                "grading_company": post.get("grading_company", ""),
+                "grade": post.get("grade", None),
+                "post_url": post.get("post_url", ""),
                 "blocked": False,
-                "user_card_ids": [],
                 "normalised_name": post.get("normalized_title", ""),
-                "category_id": post.get("metadata", {}).get("category_id"),
+                "category_id": post.get("category_id"),
             }
             db_records.append(db_record)
-        # upsert in batches with robust fallback for missing columns
+
         BATCH = 500
         for i in range(0, len(db_records), BATCH):
-            batch = db_records[i : i + BATCH]
+            json_batch = db_records[i : i + BATCH]
+            try:
+                response = supabase.rpc("fn_upsert_ebay_posts_with_counts", {"data": json_batch}).execute()
 
-            def _upsert_safe(recs: list[dict[str, any]]):
-                while True:
-                    try:
-                        supabase.table("ebay_posts").upsert(
-                            recs, on_conflict="id", returning="minimal"
-                        ).execute()
-                        return True
-                    except Exception as e:
-                        msg = str(e)
-                        # Example: Could not find the 'normalized_attributes' column of 'ebay_posts'
-                        m = re.search(r"Could not find the '([^']+)' column", msg)
-                        if m:
-                            missing_col = m.group(1)
-                            for r in recs:
-                                r.pop(missing_col, None)
-                            scraper_logger.warning(
-                                f"⚠️ Upsert retry: removed missing column '{missing_col}' from batch"
-                            )
-                            continue
-                        # Some Supabase clients return JSON dict-like errors; attempt to parse column name
-                        if "normalized_attributes" in msg:
-                            for r in recs:
-                                r.pop("normalized_attributes", None)
-                            scraper_logger.warning(
-                                "⚠️ Upsert retry: removed 'normalized_attributes' from batch"
-                            )
-                            continue
-                        if "embedding" in msg:
-                            for r in recs:
-                                r.pop("embedding", None)
-                            scraper_logger.warning(
-                                "⚠️ Upsert retry: removed 'embedding' from batch"
-                            )
-                            continue
-                        # If we cannot recover, re-raise
-                        raise
+                if response.data and len(response.data) > 0:
+                    row = response.data[0]
+                    results["inserts_count"] += row.get("inserts_count", 0)
+                    results["updates_count"] += row.get("updates_count", 0)
+                else:
+                    results["inserts_count"] += len(batch)
 
-            _upsert_safe(batch)
-            results["upserted_count"] += len(batch)
+            except Exception as e:
+                results["errors"].append(str(e))
+                raise
+
         scraper_logger.info(
-            f"✅ Upserted {results['upserted_count']} listings to ebay_posts"
+            f"✅ Upserted total {results['inserts_count']} inserts, {results['updates_count']} updates to ebay_posts"
         )
     except Exception as e:
         results["errors"].append(str(e))
         scraper_logger.error(f"❌ Failed to upsert listings: {e}")
+
+    if results["inserts_count"] > 0:
+        monitor_data = supabase.table("monitor").select("*").eq("id", 1).execute()
+        monitor_data = monitor_data.data[0]
+        if monitor_data:
+            category_count = monitor_data.get(f"ebay_posts_category_{category_id}_count", 0)
+            supabase.table("monitor").update({f"ebay_posts_category_{category_id}_count": category_count + results["inserts_count"]}).eq("id", 1).execute()
+
     return results
 
 

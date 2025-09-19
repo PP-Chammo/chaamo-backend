@@ -21,9 +21,9 @@ class CategoryId(IntEnum):
     MARVEL = 7
     GARBAGE_PAIL_KIDS = 8
     DIGIMON = 9
-    WRESTLING = 11
-    YU_GI_OH = 12
-    LORCANA = 13
+    WRESTLING = 10
+    YU_GI_OH = 11
+    LORCANA = 12
     OTHER = 99
 
     @classmethod
@@ -39,9 +39,9 @@ class CategoryId(IntEnum):
             7: "Marvel",
             8: "Garbage Pail Kids",
             9: "Digimon",
-            11: "Wrestling",
-            12: "Yu-Gi-Oh!",
-            13: "Lorcana",
+            10: "Wrestling",
+            11: "Yu-Gi-Oh!",
+            12: "Lorcana",
             99: "Other",
         }
         return name_map.get(category_id, "Unknown")
@@ -59,9 +59,9 @@ class CategoryId(IntEnum):
             7: ["Marvel"],
             8: ["Garbage Pail Kids", "Pail Kids"],
             9: ["Digimon"],
-            11: ["Wrestling"],
-            12: ["Yu-Gi-Oh", "Yu~Gi~Oh"],
-            13: ["Lorcana"],
+            10: ["Wrestling"],
+            11: ["Yu-Gi-Oh", "Yu~Gi~Oh"],
+            12: ["Lorcana"],
             99: ["Other"],
         }
         return name_map.get(category_id, "Unknown")
@@ -87,9 +87,9 @@ class CategoryDropdown(str, Enum):
     MARVEL = "7 - Marvel"
     GARBAGE_PAIL_KIDS = "8 - Garbage Pail Kids"
     DIGIMON = "9 - Digimon"
-    WRESTLING = "11 - Wrestling"
-    YU_GI_OH = "12 - Yu-Gi-Oh!"
-    LORCANA = "13 - Lorcana"
+    WRESTLING = "10 - Wrestling"
+    YU_GI_OH = "11 - Yu-Gi-Oh!"
+    LORCANA = "12 - Lorcana"
     OTHER = "99 - Other"
 
     @classmethod
