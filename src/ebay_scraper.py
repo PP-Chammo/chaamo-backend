@@ -18,7 +18,9 @@ from src.utils.scraper import (
     build_strict_promisable_candidates,
     select_best_candidate_with_gpt,
 )
+from src.utils.step import step
 from src.utils.supabase import supabase_get_card
+
 
 # --------------------------
 # Main Handler
@@ -40,7 +42,7 @@ class EbayScraper:
             mode = "query + category_id"
 
             if card_id:
-                db_card = supabase_get_card({ "id": card_id })
+                db_card = supabase_get_card({"id": card_id})
                 if db_card:
                     mode = "card_id"
                     query = db_card.get("canonical_title")
@@ -49,106 +51,143 @@ class EbayScraper:
             # ===============================================================
             # Step 1: Scrape Ebay html
             # ===============================================================
-            html_pages = await scrape_ebay_html(
-                region=region,
-                mode=mode,
-                query=query,
-                category_id=category_id,
-                card_id=card_id,
-                max_pages=max_pages,
-                disable_proxy=disable_proxy,
-            )
-
-            if not html_pages:
-                scraper_logger.error(
-                    f'❌ failed fetch ebay results for query: ------ "{query}"'
+            async with step("Scrape Ebay html"):
+                html_pages = await scrape_ebay_html(
+                    region=region,
+                    mode=mode,
+                    query=query,
+                    category_id=category_id,
+                    card_id=card_id,
+                    max_pages=max_pages,
+                    disable_proxy=disable_proxy,
                 )
+
+                if not html_pages:
+                    scraper_logger.error(
+                        f'❌ failed fetch ebay results for query: ------ "{query}"'
+                    )
 
             # ===============================================================
             # Step 2: Extract data from HTML
             # ===============================================================
-
-            posts = await extract_ebay_post_data(
-                html_pages=html_pages,
-                region=region.value,
-                category_id=category_id.value,
-            )
+            async with step("Extract data from HTML"):
+                posts = await extract_ebay_post_data(
+                    html_pages=html_pages,
+                    region=region.value,
+                    category_id=category_id.value,
+                )
 
             # ===============================================================
             # Step 3: Store ebay listings into supabase tables ebay_posts
             # ===============================================================
-
-            upsert_results = await upsert_ebay_listings(posts)
+            async with step("Store ebay listings into supabase tables ebay_posts"):
+                upsert_results = await upsert_ebay_listings(posts)
 
             # ===============================================================
             # Step 3 (card_id mode only): Building a "promisable candidates" list by strictly matching all non-null fields with medium/high proofs
             # ===============================================================
-
-            if mode == "card_id":
-                selected_card = await get_card(card_id)
-                attribute_filters = {k: v for k, v in selected_card.items() if v}
-                years = attribute_filters.get("years", [])
-                attribute_filters["years"] = f"{years[0]}-{years[1][-2:]}" if len(years) >= 2 else years[0] if years else ""
-
-                candidates_result = build_strict_promisable_candidates(
-                    attribute_filters=attribute_filters,
-                    posts=posts,
-                )
-                match_posts = candidates_result.get("match_posts", [])
-
-                # ===============================================================
-                # Step 4 (card_id mode only): Selecting the best candidate using GPT
-                # ===============================================================
-                best_matched_post = None
-                reason = "ebay posts (after normalized) count 0 because not matched any post, cannot continue to select best candidate"
-                if len(match_posts) > 0:
-                    selection_result = await select_best_candidate_with_gpt(
-                        canonical_title=(
-                            selected_card.get("canonical_title") if selected_card else None
-                        ),
-                        match_posts=match_posts,
+            async with step('Building a "promisable candidates" list'):
+                if mode == "card_id":
+                    selected_card = await get_card(card_id)
+                    attribute_filters = {k: v for k, v in selected_card.items() if v}
+                    years = attribute_filters.get("years", [])
+                    attribute_filters["years"] = (
+                        f"{years[0]}-{years[1][-2:]}"
+                        if len(years) >= 2
+                        else years[0] if years else ""
                     )
 
-                    await update_card(
-                        selected_post=selection_result.get("last_sold_post", None),
-                        gpt_reason=selection_result.get("reason", None),
-                        card_id=card_id,
+                    candidates_result = build_strict_promisable_candidates(
+                        attribute_filters=attribute_filters,
+                        posts=posts,
                     )
-                    best_matched_post = selection_result.get("last_sold_post")
-                    reason = selection_result.get("reason", reason)
+                    match_posts = candidates_result.get("match_posts", [])
 
-                results = {
-                    "result_count": len(posts),
-                    "upsert_count": upsert_results.get("inserts_count", 0) + upsert_results.get("updates_count", 0),
-                    "insert_count": upsert_results.get("inserts_count", 0),
-                    "update_count": upsert_results.get("updates_count", 0),
-                    "best_matched_post": best_matched_post,
-                    "reason": reason,
-                }
-                scraper_logger.info(f"[selected last sold post] --- {json.dumps(results['best_matched_post'], indent=2, ensure_ascii=False)}")
-                scraper_logger.info(f"[reason] --- {results['reason']}")
-                scraper_logger.info(f"[result count] --- {results['result_count']}")
-                scraper_logger.info(f"[insert count] --- {results['insert_count']}")
-                scraper_logger.info(f"[update count] --- {results['update_count']}")
-                scraper_logger.info(
-                    f"🎉 Scraping [{mode}] completed: {results['result_count']} posts processed"
-                )
-                return results
+                    # ===============================================================
+                    # Step 4 (card_id mode only): Selecting the best candidate using GPT
+                    # ===============================================================
+                    best_matched_post = None
+                    reason = "Please double check your card attributes and specify clearly for years, brand, set, character, and variation to find the best match."
+                    if len(match_posts) > 0:
+                        async with step("Selecting the best candidate using GPT"):
+                            parts = [
+                                f'{k}: "{v}"'
+                                for k, v in attribute_filters.items()
+                                if k != "canonical_title" and v != ""
+                            ]
+                            extracted_canonical_title = ", ".join(parts)
 
-            else:
-                results = {
-                    "result_count": len(posts),
-                    "upsert_count": upsert_results.get("inserts_count", 0) + upsert_results.get("updates_count", 0),
-                    "insert_count": upsert_results.get("inserts_count", 0),
-                    "update_count": upsert_results.get("updates_count", 0),
-                }
-                scraper_logger.info(f"[result count] --- {results['result_count']}")
-                scraper_logger.info(f"[insert count] --- {results['insert_count']}")
-                scraper_logger.info(f"[update count] --- {results['update_count']}")
-                scraper_logger.info(
-                    f"🎉 Scraping [{mode}] completed: {results['result_count']} posts processed"
-                )
-                return results
+                            scraper_logger.info(
+                                f"[extracted canonical title] --- {extracted_canonical_title}"
+                            )
+                            selection_result = await select_best_candidate_with_gpt(
+                                canonical_title=(
+                                    selected_card.get("canonical_title")
+                                    if selected_card
+                                    else None
+                                ),
+                                extracted_canonical_title=extracted_canonical_title,
+                                match_posts=match_posts,
+                            )
+
+                        async with step(f'Updating db table card with id "{card_id}"'):
+                            await update_card(
+                                selected_post=selection_result.get(
+                                    "last_sold_post", None
+                                ),
+                                gpt_reason=(
+                                    f"{selection_result.get('reason')} {reason}"
+                                    if selection_result.get("reason")
+                                    else reason
+                                ),
+                                match_post_ids=selection_result.get("match_post_ids"),
+                                card_id=card_id,
+                            )
+                            print("xxxx", selection_result.get("last_sold_post"))
+                            if selection_result.get("last_sold_post"):
+                                best_matched_post = selection_result.get(
+                                    "last_sold_post"
+                                )
+                                reason = selection_result.get("reason", reason)
+
+                    results = {
+                        "result_count": len(posts),
+                        "upsert_count": upsert_results.get("inserts_count", 0)
+                        + upsert_results.get("updates_count", 0),
+                        "insert_count": upsert_results.get("inserts_count", 0),
+                        "update_count": upsert_results.get("updates_count", 0),
+                        "best_matched_post": best_matched_post,
+                        "reason": reason,
+                    }
+                    if results["best_matched_post"]:
+                        scraper_logger.info(
+                            f"best matched post --- {json.dumps(results['best_matched_post'], indent=2, ensure_ascii=False)}"
+                        )
+
+                    scraper_logger.info(f"🤖 reason --- {results['reason']}")
+                    scraper_logger.info(f"result count --- {results['result_count']}")
+                    scraper_logger.info(f"insert count --- {results['insert_count']}")
+                    scraper_logger.info(f"update count --- {results['update_count']}")
+                    scraper_logger.info(
+                        f"🎉 Scraping task mode [{mode}] completed processed {results['result_count']} posts."
+                    )
+                    return results
+
+                else:
+                    results = {
+                        "result_count": len(posts),
+                        "upsert_count": upsert_results.get("inserts_count", 0)
+                        + upsert_results.get("updates_count", 0),
+                        "insert_count": upsert_results.get("inserts_count", 0),
+                        "update_count": upsert_results.get("updates_count", 0),
+                    }
+                    scraper_logger.info(f"[result count] --- {results['result_count']}")
+                    scraper_logger.info(f"[insert count] --- {results['insert_count']}")
+                    scraper_logger.info(f"[update count] --- {results['update_count']}")
+                    scraper_logger.info(
+                        f"🎉 Scraping task mode [{mode}] completed processed {results['result_count']} posts."
+                    )
+                    return results
 
         except Exception as e:
             scraper_logger.error(f"❌ Scraping failed: {e}")

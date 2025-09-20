@@ -18,6 +18,7 @@ from urllib.parse import urlencode
 from src.models.category import CategoryId
 from src.models.ebay import Region, base_target_url
 from src.utils.httpx import httpx_get_content
+from src.utils.maybe import maybe
 from src.utils.supabase import supabase
 from src.utils.logger import scraper_logger
 
@@ -269,7 +270,11 @@ async def scrape_ebay_html(
             scraper_logger.warning(f"⚠️ Error getting page count: {e}")
 
     total_pages = min(max_pages, total_pages)
-    scraper_logger.info(f"🚀 [Scraping {total_pages} pages] ---- '{query}'")
+
+    if total_pages > 1:
+        scraper_logger.info(f"🚀 Prepare Scraping {total_pages} pages")
+
+    scraper_logger.info(f'Scraping with keyword "{query}"')
 
     html_pages = []
     for page in range(1, total_pages + 1):
@@ -299,7 +304,7 @@ async def scrape_ebay_html(
                     "_sop": "12",
                 }
                 scraper_logger.info(
-                    f"📡 [eBay URL] --- {config['base_url']}?{urlencode(params)}"
+                    f"📡 Scraping --- {config['base_url']}?{urlencode(params)}"
                 )
                 timeout = random.uniform(12.0, 18.0)
                 jitter_min = random.uniform(0.5, 1.2)
@@ -694,9 +699,7 @@ def build_strict_promisable_candidates(
             if k
             in ["years", "card_set", "name", "variation", "serial_number", "number"]
         }
-        scraper_logger.info(
-            f"[build_candidates] filters: {json.dumps(dbg_filters, ensure_ascii=False)}"
-        )
+
     except Exception:
         pass
 
@@ -774,6 +777,7 @@ GPT_MODEL = os.getenv("OPENAI_RERANK_MODEL", "gpt-4o-mini")
 
 async def select_best_candidate_with_gpt(
     canonical_title: Optional[str],
+    extracted_canonical_title: Optional[Dict],
     match_posts: List[Dict],
 ) -> Optional[Dict]:
     """Return the single best candidate (full post) chosen by GPT and finalized by most recent sold_date.
@@ -801,34 +805,35 @@ async def select_best_candidate_with_gpt(
         )
 
     scraper_logger.info(json.dumps(compact, indent=2, ensure_ascii=False))
-    scraper_logger.info(f"[compact count before send] --- {len(compact)} posts")
-    scraper_logger.info("--------------------------------------")
+    scraper_logger.info(f"list count before send to gpt --- {len(compact)} posts")
 
     system_prompt = (
         "You are an EXPERT trading-card matcher. Decide whether each candidate refers to the SAME underlying card as the canonical title. Apply these principles: "
-        "1) Core identity is defined by: product line/set/series + subject (player/character/team/item/trainer/stadium) + card number when provided. "
+        "1) Core identity = product line/set/series (brand+series) + subset/insert (if any) + subject (player/character/team/item/trainer/stadium) + card number when provided. These define the card. "
         "2) Normalize case, punctuation, hyphens, common abbreviations, and spacing; treat equivalent naming and order-insensitive wording as the same. "
-        "3) Set/product line must be the same family (brand + series). Treat optional competition/region qualifiers (e.g., 'UCL', 'Champions League', 'EPL', 'La Liga', 'World Cup') as the SAME family when brand+series match; their presence/absence alone must not cause a set mismatch (e.g., 'Topps Now' ≈ 'UCL Topps Now'). Different product LINES (e.g., 'Topps Now' vs 'Topps Chrome/Sapphire/Museum Collection') are NOT matches. "
-        "4) If the canonical includes a card number, prefer candidates with the same number; ignore '#' and leading zeros and tolerate separators. If a candidate shows a different number, EXCLUDE it. "
+        "3) Product line must be the same family (brand + series). Treat optional competition/region qualifiers (e.g., 'UCL', 'Champions League', 'EPL', 'La Liga', 'World Cup') as the SAME family when brand+series match; their presence/absence alone must not cause a set mismatch (e.g., 'Topps Now' ≈ 'UCL Topps Now'). Different product LINES (e.g., 'Topps Now' vs 'Topps Chrome/Sapphire/Museum Collection') are NOT matches. "
+        "4) Card number: if the canonical includes a card number, require the same number; ignore '#', letter case, leading zeros, and separators (e.g., 'MG-35' ≈ 'mg35'). If a candidate shows a different number, EXCLUDE it. "
         "5) Year is informative but NOT required; treat 'YYYY' and 'YYYY-YY'/'YYYY-YYYY' season ranges as compatible when they overlap or share the start year (e.g., '2024' ≈ '2024-25'); do not exclude solely for that difference when core identity matches. "
-        "6) Variations/parallels: When the canonical specifies a specific variant (color/finish/parallel/print-run, autograph, memorabilia, promo/pre-release), EXCLUDE candidates that explicitly state a different variant. When the canonical is silent, ACCEPT base and minor surface-finish variants typical to the product line; treat grading as non-identity. "
-        "7) Quantity/lot terms (e.g., playset, x2/x4, set of N) do not alter identity—do not exclude for quantity alone. "
+        "6) Subset/insert vs finish/parallel: (a) Subset/insert names (e.g., 'Gamers Report', 'Future Stars', 'Rookie Ticket') ARE part of identity and should match when present in the canonical. (b) Finish/parallel descriptors (e.g., 'Refractor', 'Holo', 'Foil', generic 'Silver') DO NOT change identity when the canonical is silent—accept them as the same underlying card typical to the product line. Only EXCLUDE when the canonical explicitly specifies a conflicting finish/parallel or if the candidate is autograph/memorabilia while the canonical is not. Grading never changes identity. "
+        "7) Quantity/lot terms (playset, x2/x4, set of N) do not alter identity—do not exclude for quantity alone. Extra words like team names do not change identity unless the subject itself differs. "
         "8) Ignore boilerplate (game/sport name, generic words like 'card', condition terms) unless they convey identity (e.g., team vs player). "
-        "9) Examples: Valid → '2024 Topps Now #12' vs '2024-25 UCL Topps Now #12' (same family + subject/number). Invalid → 'Topps Now' vs 'Topps Chrome #12' (different product lines). "
+        "9) Strong-match rule: when years (compatible), product line (+subset/insert), subject, and card number all align, classify as the SAME card even if a finish-level term (e.g., 'Refractor') appears only in the candidate. "
+        "10) Examples: Valid → '2024 Topps Now #12' vs '2024-25 UCL Topps Now #12' (same family + subject/number). Valid → '2023-24 Topps Merlin Gavi Gamers Report #MG-35' vs '2023-24 Topps Merlin Gamers Report Gavi Refractor #MG-35 Barcelona' (subset matches; 'Refractor' is a finish-level descriptor; number matches). Invalid → 'Topps Now' vs 'Topps Chrome #12' (different product lines). "
         "Return a JSON object: {matches: [indices], reason: string}. Include indices only when the core identity rules are satisfied. If none qualify, return an empty list and briefly explain why."
     )
 
     user_prompt = {
         "canonical_title": canonical_title or "",
+        "extracted_canonical_title": extracted_canonical_title or "",
         "candidates": compact,
         "instructions": (
             "Compare 'canonical_title' with each candidate using both 'raw' and 'normalized' titles. "
-            "Include an index ONLY IF the core identity matches: same product line/set/series (semantic family), same subject (player/character/team/item/trainer/stadium), and — when the canonical provides it — the same card number (ignoring '#', leading zeros, and separators). "
+            "Include an index ONLY IF the core identity matches: same product line/set/series (semantic family), same subset/insert (if present), same subject, and — when the canonical provides it — the same card number (ignoring '#', leading zeros, and separators). "
             "Treat competition/league qualifiers as optional ('UCL'/'Champions League', 'EPL', etc.): their presence or absence must NOT be considered a set mismatch when brand+series match (e.g., 'Topps Now' ≈ 'UCL Topps Now'). "
             "Year is optional; regard 'YYYY' and 'YYYY-YY'/'YYYY-YYYY' seasons as compatible when overlapping or sharing a start year (e.g., '2024' ≈ '2024-25'). "
-            "If the canonical specifies a particular variant, exclude candidates explicitly stating a different variant; otherwise accept typical minor finish variants for the product line. Quantity/lot terms do not affect identity. "
+            "Distinguish subset/insert vs finish/parallel: require subset/insert names (e.g., 'Gamers Report') to match when present in canonical; ACCEPT finish-level descriptors (e.g., 'Refractor', 'Holo', 'Foil', generic 'Silver') when canonical is silent. EXCLUDE only if the canonical explicitly names a different finish/parallel or if the candidate is autograph/memorabilia while the canonical is not. Quantity/lot terms do not affect identity. "
             "Treat serial/print-run and grading as informative signals but not strictly required unless mismatched values change identity. "
-            'Return JSON: {"matches": [i1, i2, ...], "reason": <string>}. If none qualify, leave matches empty and provide a concise reason (e.g., set mismatch, different variant, number mismatch, uncertain identity).'
+            'Return JSON: {"matches": [i1, i2, ...], "reason": <string>}. If none qualify, leave matches empty and provide a concise reason (e.g., set mismatch, number mismatch, explicit conflicting parallel, uncertain identity).'
         ),
     }
 
@@ -853,7 +858,7 @@ async def select_best_candidate_with_gpt(
             data = r.json()
         content = data["choices"][0]["message"]["content"]
         parsed = json.loads(content)
-        scraper_logger.info(f"[GPT response] --- {content}")
+        scraper_logger.info("🤖 GPT response --- " + content)
         idxs = parsed.get("matches", [])
 
         selected_indices: List[int] = [
@@ -871,13 +876,16 @@ async def select_best_candidate_with_gpt(
 
         scraper_logger.info("--------------------------------------")
         scraper_logger.info(
-            f"[candidates] --- {json.dumps(selected_posts, indent=4, ensure_ascii=False)}"
+            f"candidates by gpt --- {json.dumps(selected_posts, indent=2, ensure_ascii=False)}"
         )
+
+        match_post_ids = [str(c.get("id")) for c in compact]
 
         if not selected_posts:
             return {
                 "last_sold_post": None,
                 "reason": parsed.get("reason"),
+                "match_post_ids": match_post_ids,
             }
 
         last_sold_post = max(selected_posts, key=sold_ts)
@@ -885,6 +893,7 @@ async def select_best_candidate_with_gpt(
         return {
             "last_sold_post": last_sold_post,
             "reason": parsed.get("reason"),
+            "match_post_ids": match_post_ids,
         }
     except Exception as e:
         scraper_logger.info(f"⚠️ GPT selection failed: {e}")
@@ -899,12 +908,17 @@ async def select_best_candidate_with_gpt(
 # Update user card with selected post
 # ===============================================================
 async def update_card(
-    selected_post: dict[str, any], gpt_reason: str, card_id: str
+    selected_post: dict[str, any],
+    gpt_reason: str,
+    match_post_ids: list[str],
+    card_id: str,
 ) -> dict[str, any]:
     results = {"card_updated": False, "errors": []}
     try:
+        print("xx")
         update_data = {
             "last_sold_debug": gpt_reason,
+            "last_sold_candidate_ids": match_post_ids,
         }
 
         if selected_post:
@@ -914,13 +928,17 @@ async def update_card(
                 "last_sold_currency": selected_post.get("currency"),
                 "last_sold_at": selected_post.get("sold_at"),
                 "last_sold_debug": gpt_reason,
+                "last_sold_candidate_ids": match_post_ids,
+                "last_sold_id": selected_post.get("id"),
             }
+        print("xxx")
 
         supabase.table("cards").update(update_data).eq("id", card_id).execute()
         results["card_updated"] = True
         scraper_logger.info(
-            f"✅ Updated card {card_id}: price={selected_post.get('price')} {selected_post.get('currency')}"
+            f"✅ Updated card {card_id}: price={maybe(selected_post).get('price', 0)} {maybe(selected_post).get('currency')}"
         )
+        print("xxxx")
     except Exception as e:
         results["errors"].append(str(e))
         scraper_logger.error(f"❌ Failed update cards: {e}")

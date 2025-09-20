@@ -25,7 +25,7 @@ logger_stub_mod.scraper_logger = logger_stub
 logger_stub_mod.setup_logger = lambda *a, **k: logger_stub
 sys.modules['src.utils.logger'] = logger_stub_mod
 
-from src.utils.ebay import word_match
+from src.utils.scraper import word_match
 
 
 # ---------- Simple and baseline behavior ----------

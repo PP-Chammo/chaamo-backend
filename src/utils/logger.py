@@ -67,6 +67,7 @@ class ColorFormatter(logging.Formatter):
         "proxy": "🔄",
         "httpx": "✈️ ",
         "supabase": "💾",
+        "step": "▶️ ",
     }
 
     def format(self, record):
@@ -195,6 +196,7 @@ scraper_logger = setup_logger("chaamo.scraper")
 scheduler_logger = setup_logger("chaamo.scheduler")
 httpx_logger = setup_logger("chaamo.httpx")
 supabase_logger = setup_logger("chaamo.supabase")
+step_logger = setup_logger("chaamo.step")
 
 
 # Convenience helpers for explicit success/failure context

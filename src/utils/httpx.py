@@ -209,13 +209,13 @@ async def httpx_get_content(
     for connection_type, proxy_config in connection_attempts:
         # Log connection attempt
         if connection_type == "zyte_ssl":
-            httpx_logger.info("🔐 [Use Zyte] --- with SSL verification")
+            httpx_logger.info("🔐 Use Zyte SSL verification")
         elif connection_type == "zyte_no_ssl":
-            httpx_logger.info("🔓 [Use Zyte] --- without SSL verification")
+            httpx_logger.info("🔓 Use Zyte without SSL verification")
         elif connection_type == "proxy":
-            httpx_logger.info(f"🌐 [Use Proxy] --- {proxy_config}")
+            httpx_logger.info(f"🌐 Use Proxy {proxy_config}")
         else:
-            logger.info(f"🔗 [Use Direct] ---")
+            httpx_logger.info("🔗 Use Direct")
 
         use_http2 = bool(random.getrandbits(1))
         limits = httpx.Limits(
